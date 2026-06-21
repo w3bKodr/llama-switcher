@@ -164,11 +164,8 @@ fn process_ancestry_command_lines(_pid: u32) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// Is the TCP port free on 127.0.0.1?
-pub fn is_port_free(port: u16) -> bool {
-    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
-}
-
-/// Find the PID of the process listening on `port`, if any (Windows: netstat).
+/// Find the PID of the process listening on `port`, if any (netstat).
+/// Works for both IPv4 (127.0.0.1:port) and IPv6 ([::1]:port) listeners.
 pub fn pid_on_port(port: u16) -> Option<u32> {
     let mut cmd = Command::new("netstat");
     cmd.args(["-ano", "-p", "TCP"]);
@@ -191,6 +188,12 @@ pub fn pid_on_port(port: u16) -> Option<u32> {
     None
 }
 
+/// Check whether the port is free by looking for any LISTENING process.
+/// Uses netstat so it works for both IPv4 and IPv6 bindings.
+pub fn is_port_free(port: u16) -> bool {
+    pid_on_port(port).is_none()
+}
+
 // ---------------------------------------------------------------------------
 // Stop
 // ---------------------------------------------------------------------------
@@ -200,8 +203,6 @@ pub fn pid_on_port(port: u16) -> Option<u32> {
 /// the stop timeout elapses.
 pub fn stop_server(app: &AppHandle, state: &Arc<AppState>) -> Result<Status, String> {
     let settings = state.settings_snapshot();
-    // Take the running process out so status reports "stopping" as stopped and
-    // we don't hold the lock across sleeps.
     let mut rp = match state.running.lock().unwrap().take() {
         Some(rp) => rp,
         None => {
@@ -216,39 +217,43 @@ pub fn stop_server(app: &AppHandle, state: &Arc<AppState>) -> Result<Status, Str
     let log_path = rp.log_path.clone();
     logging::append_line(&log_path, "Stop requested.");
 
-    // 1. Graceful tree stop (no force).
-    graceful_kill(rp.pid);
+    // 1. Kill the managed process tree (shell + all known descendants).
+    let tree = process_tree::descendants(rp.pid);
+    logging::append_line(&log_path, &format!("Killing tree of {} processes (root PID {}).", tree.len(), rp.pid));
+    process_tree::kill_tree(rp.pid);
+    let _ = rp.child.wait();
 
-    // 2. Wait for the tree + port to clear.
-    let timeout = Duration::from_secs(settings.stop_timeout_seconds.max(1));
-    let start = Instant::now();
-    let mut cleared = false;
-    while start.elapsed() < timeout {
-        let tree_gone = rp.child.try_wait().map(|w| w.is_some()).unwrap_or(true)
-            && process_tree::descendants(rp.pid).len() <= 1;
-        if tree_gone && is_port_free(settings.server_port) {
-            cleared = true;
+    // 2. Aggressive port cleanup loop: keep finding and killing the PARENT
+    //    tree of whatever process is holding the port. This handles restart
+    //    loops (parent script respawns child), orphaned grandchildren, and
+    //    reparented processes that survive the initial tree kill.
+    let deadline = Instant::now() + Duration::from_secs(settings.stop_timeout_seconds.max(1));
+    let mut killed_count = 0;
+    while Instant::now() < deadline {
+        if is_port_free(settings.server_port) {
             break;
         }
-        thread::sleep(Duration::from_millis(250));
+        if let Some(pid) = pid_on_port(settings.server_port) {
+            killed_count += 1;
+            logging::append_line(&log_path, &format!("Port still occupied by PID {}; killing parent tree.", pid));
+            process_tree::kill_parent_tree(pid);
+            thread::sleep(Duration::from_millis(500));
+        } else {
+            // Port not free but no listener found (e.g. TIME_WAIT) — wait.
+            thread::sleep(Duration::from_millis(250));
+        }
     }
 
-    // 3. Force-kill the whole tree if it survived the grace period.
-    if !cleared {
-        logging::append_line(&log_path, "Graceful stop timed out; force-killing process tree.");
-        process_tree::kill_tree(rp.pid);
-        thread::sleep(Duration::from_millis(400));
-    }
-
-    let _ = rp.child.wait();
     let port_free = is_port_free(settings.server_port);
     logging::append_line(
         &log_path,
         &format!(
-            "Stopped at {}. Port {} free: {}.",
+            "Stopped at {}. Port {} free: {}. Killed {} extra process{}.",
             chrono::Local::now().format("%Y-%m-%dT%H:%M:%S"),
             settings.server_port,
-            port_free
+            port_free,
+            killed_count,
+            if killed_count == 1 { "" } else { "es" }
         ),
     );
 
@@ -261,16 +266,6 @@ pub fn stop_server(app: &AppHandle, state: &Arc<AppState>) -> Result<Status, Str
         ));
     }
     Ok(state.status())
-}
-
-/// Best-effort graceful kill of the tree without /F (gives the shell a chance to
-/// exit cleanly). On Windows we use taskkill /T which signals the whole tree.
-fn graceful_kill(pid: u32) {
-    let mut cmd = Command::new("taskkill");
-    cmd.args(["/PID", &pid.to_string(), "/T"]);
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let _ = cmd.output();
 }
 
 // ---------------------------------------------------------------------------
@@ -348,8 +343,8 @@ fn ensure_port_available(app: &AppHandle, settings: &Settings) -> Result<(), Str
     stop_external_listener(app, settings, "Start / Switch requested")
 }
 
-/// Stop a listener not represented in `state.running`. Try a graceful tree
-/// stop first, then force the tree if the port survives the configured timeout.
+/// Stop a listener not represented in `state.running`. Aggressively kill
+/// whatever is on the port until it clears.
 fn stop_external_listener(
     app: &AppHandle,
     settings: &Settings,
@@ -359,45 +354,34 @@ fn stop_external_listener(
         return Ok(());
     }
 
-    let pid = pid_on_port(settings.server_port).ok_or_else(|| {
-        format!(
-            "Port {} is in use but the owning process could not be identified.",
-            settings.server_port
-        )
-    })?;
-    let _ = app.emit(
-        "warning",
-        format!(
-            "{}: stopping PID {} on server port {}.",
-            reason, pid, settings.server_port
-        ),
-    );
-
-    graceful_kill(pid);
-    let timeout = Duration::from_secs(settings.stop_timeout_seconds.max(1));
-    let start = Instant::now();
-    while start.elapsed() < timeout {
+    let deadline = Instant::now() + Duration::from_secs(settings.stop_timeout_seconds.max(1));
+    while Instant::now() < deadline {
         if is_port_free(settings.server_port) {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(250));
-    }
-
-    // Re-resolve in case the original shell exited but a child retained the
-    // listener, or a supervisor immediately replaced it.
-    let remaining_pid = pid_on_port(settings.server_port).unwrap_or(pid);
-    process_tree::kill_tree(remaining_pid);
-    let force_deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < force_deadline {
-        if is_port_free(settings.server_port) {
-            return Ok(());
+        match pid_on_port(settings.server_port) {
+            Some(pid) => {
+                let _ = app.emit(
+                    "warning",
+                    format!(
+                        "{}: killing parent tree of PID {} on server port {}.",
+                        reason, pid, settings.server_port
+                    ),
+                );
+                // Kill the PARENT tree, not just the listener.
+                // This terminates the restart-loop script AND all its children.
+                process_tree::kill_parent_tree(pid);
+                thread::sleep(Duration::from_millis(500));
+            }
+            None => {
+                thread::sleep(Duration::from_millis(250));
+            }
         }
-        thread::sleep(Duration::from_millis(150));
     }
 
     Err(format!(
-        "Port {} is still in use after stopping PID {}.",
-        settings.server_port, remaining_pid
+        "Port {} is still in use after {}s.",
+        settings.server_port, settings.stop_timeout_seconds
     ))
 }
 

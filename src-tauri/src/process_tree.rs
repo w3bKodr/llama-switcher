@@ -88,6 +88,39 @@ mod imp {
             terminate(pid);
         }
     }
+
+    /// Look up the parent PID of `pid` from a ToolHelp snapshot.
+    pub fn parent_of(pid: u32) -> Option<u32> {
+        let map = snapshot();
+        let ppid = *map.get(&pid)?;
+        if ppid == 0 {
+            None  // system root (no parent)
+        } else {
+            Some(ppid)
+        }
+    }
+
+    /// Kill the tree rooted at the PARENT of `pid`.
+    ///
+    /// This is essential when an external server's listener process
+    /// (e.g. llama-server.exe) is restarted by a parent script.
+    /// Killing only the listener lets the script respawn it.
+    /// Killing the parent tree terminates both the script AND all
+    /// its children, breaking restart loops.
+    ///
+    /// Safety: refuses to kill PID 0 (system) or PID 4 (csrss.exe).
+pub fn kill_parent_tree(pid: u32) {
+        if let Some(ppid) = parent_of(pid) {
+            if ppid != 0 && ppid != 4 {
+                kill_tree(ppid);
+            } else {
+                // Parent is a system process — just kill the target itself.
+                terminate(pid);
+            }
+        } else {
+            terminate(pid);
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -96,6 +129,7 @@ mod imp {
         vec![root]
     }
     pub fn kill_tree(_root: u32) {}
+    pub fn kill_parent_tree(_pid: u32) {}
 }
 
-pub use imp::{descendants, kill_tree};
+pub use imp::{descendants, kill_parent_tree, kill_tree};

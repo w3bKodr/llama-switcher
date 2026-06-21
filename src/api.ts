@@ -11,6 +11,7 @@ import type {
 
 export const api = {
   getStatus: () => invoke<Status>("get_status"),
+  isServerReachable: () => invoke<boolean>("is_server_reachable"),
   getSettings: () => invoke<Settings>("get_settings"),
   saveSettings: (settings: Settings) =>
     invoke<Settings>("save_settings", { settings }),

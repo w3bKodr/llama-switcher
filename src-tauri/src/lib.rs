@@ -77,6 +77,14 @@ async fn get_status(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<S
         .map_err(|e| e.to_string())
 }
 
+/// Lightweight port probe without takeover side-effects. Used by the UI to
+/// decide whether to enable the Stop button.
+#[tauri::command]
+fn is_server_reachable(state: State<'_, Arc<AppState>>) -> bool {
+    let settings = state.settings_snapshot();
+    process_manager::probe_reachable(&settings.health_url)
+}
+
 #[tauri::command]
 fn get_settings(state: State<'_, Arc<AppState>>) -> Settings {
     state.settings_snapshot()
@@ -395,6 +403,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
+            is_server_reachable,
             get_settings,
             save_settings,
             rescan_scripts,
