@@ -1,0 +1,21 @@
+{
+  "name": "llama-switcher-hermes-skill",
+  "version": "0.1.0",
+  "description": "Thin adapter that lets Hermes Agent control the Llama Switcher tray app via its local HTTP API.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "smoke": "node --loader ts-node/esm src/smoke.ts"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "@types/node": "^22.9.0"
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "name": "llama-switcher",
+  "version": "0.1.0",
+  "description": "Control the local Llama Switcher tray app to start, stop, restart, rescan, and switch llama.cpp server profiles. Hermes Agent uses this skill instead of running .cmd/.bat/.ps1 files directly.",
+  "entry": "dist/index.js",
+  "env": {
+    "LLAMA_SWITCHER_BASE_URL": "http://127.0.0.1:47891",
+    "LLAMA_SWITCHER_API_TOKEN": ""
+  },
+  "tools": [
+    {
+      "name": "llama_switcher_status",
+      "description": "Check which llama.cpp server profile is currently running.",
+      "inputSchema": { "type": "object", "properties": {} }
+    },
+    {
+      "name": "llama_switcher_list_profiles",
+      "description": "List detected llama.cpp profiles from the configured scripts folder.",
+      "inputSchema": { "type": "object", "properties": {} }
+    },
+    {
+      "name": "llama_switcher_rescan",
+      "description": "Rescan the scripts folder for llama.cpp startup files.",
+      "inputSchema": { "type": "object", "properties": {} }
+    },
+    {
+      "name": "llama_switcher_switch_by_alias",
+      "description": "Switch to a llama.cpp profile using a human-readable alias such as Qwen-27B MTP.",
+      "inputSchema": {
+        "type": "object",
+        "properties": { "alias": { "type": "string" } },
+        "required": ["alias"]
+      }
+    },
+    {
+      "name": "llama_switcher_switch_by_name",
+      "description": "Switch to a llama.cpp profile using model and feature.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string" },
+          "feature": { "type": "string" }
+        },
+        "required": ["model", "feature"]
+      }
+    },
+    {
+      "name": "llama_switcher_restart",
+      "description": "Restart the currently running llama.cpp server profile.",
+      "inputSchema": { "type": "object", "properties": {} }
+    },
+    {
+      "name": "llama_switcher_stop",
+      "description": "Stop the currently running llama.cpp server.",
+      "inputSchema": { "type": "object", "properties": {} }
+    },
+    {
+      "name": "llama_switcher_open_dashboard",
+      "description": "Open the Llama Switcher dashboard window.",
+      "inputSchema": { "type": "object", "properties": {} }
+    }
+  ]
+}

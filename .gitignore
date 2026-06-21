@@ -1,0 +1,20 @@
+# Node / Vite
+node_modules
+dist
+dist-ssr
+*.local
+
+# Rust / Tauri
+src-tauri/target
+
+# Hermes skill
+hermes-skill/node_modules
+hermes-skill/dist
+hermes-skill/.env
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+Thumbs.db
