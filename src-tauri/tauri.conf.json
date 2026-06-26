@@ -37,6 +37,8 @@
       "icons/icon.ico"
     ],
     "resources": {
+      "icons/window-icon.png": "window-icon.png",
+      "icons/icon.ico": "desktop-icon.ico",
       "../hermes-skill/SKILL.md": "hermes-skill/SKILL.md",
       "../hermes-skill/scripts": "hermes-skill/scripts",
       "../hermes-skill/README.md": "hermes-skill/README.md"

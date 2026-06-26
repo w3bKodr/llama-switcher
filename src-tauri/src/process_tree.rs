@@ -42,6 +42,62 @@ mod imp {
         map
     }
 
+    /// (pid, image-file-name) for every running process.
+    fn snapshot_named() -> Vec<(u32, String)> {
+        let mut out = vec![];
+        unsafe {
+            let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+                Ok(h) => h,
+                Err(_) => return out,
+            };
+            let mut entry = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            if Process32FirstW(snap, &mut entry).is_ok() {
+                loop {
+                    out.push((entry.th32ProcessID, exe_name(&entry.szExeFile)));
+                    if Process32NextW(snap, &mut entry).is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = CloseHandle(snap);
+        }
+        out
+    }
+
+    fn exe_name(buf: &[u16]) -> String {
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..len])
+    }
+
+    /// All PIDs whose image name matches one of `names` (case-insensitive).
+    pub fn pids_by_image(names: &[String]) -> Vec<u32> {
+        let lowered: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+        snapshot_named()
+            .into_iter()
+            .filter(|(_, name)| {
+                let n = name.to_lowercase();
+                lowered.iter().any(|wanted| wanted == &n)
+            })
+            .map(|(pid, _)| pid)
+            .collect()
+    }
+
+    /// Terminate every process (and its descendants) whose image name matches
+    /// one of `names`. Returns how many top-level matches were killed. This is
+    /// what guarantees a single running server even for detached/orphaned
+    /// processes whose parent link is broken or that bound a different port.
+    pub fn kill_all_by_image(names: &[String]) -> usize {
+        let pids = pids_by_image(names);
+        let count = pids.len();
+        for pid in pids {
+            kill_tree(pid);
+        }
+        count
+    }
+
     /// All descendants of `root` (including `root` itself), parents last.
     pub fn descendants(root: u32) -> Vec<u32> {
         let map = snapshot();
@@ -130,6 +186,12 @@ mod imp {
     }
     pub fn kill_tree(_root: u32) {}
     pub fn kill_parent_tree(_pid: u32) {}
+    pub fn pids_by_image(_names: &[String]) -> Vec<u32> {
+        vec![]
+    }
+    pub fn kill_all_by_image(_names: &[String]) -> usize {
+        0
+    }
 }
 
-pub use imp::{descendants, kill_parent_tree, kill_tree};
+pub use imp::{descendants, kill_all_by_image, kill_parent_tree, kill_tree};

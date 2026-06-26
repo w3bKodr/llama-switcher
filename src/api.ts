@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentApiInfo,
   LogEntry,
+  LogUpdate,
   Profile,
   ScanResult,
   Settings,
@@ -32,6 +33,8 @@ export const api = {
 
   readLatestLog: () => invoke<string>("read_latest_log"),
   readLog: (path: string) => invoke<string>("read_log", { path }),
+  readLogUpdate: (path: string, offset: number) =>
+    invoke<LogUpdate>("read_log_update", { path, offset }),
   listLogs: () => invoke<LogEntry[]>("list_logs"),
   clearOldLogs: () => invoke<number>("clear_old_logs"),
   openLogsFolder: () => invoke<void>("open_logs_folder"),

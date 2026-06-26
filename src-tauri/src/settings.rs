@@ -20,6 +20,10 @@ pub struct Settings {
     pub allowed_extensions: Vec<String>,
     pub server_port: u16,
     pub health_url: String,
+    /// Optional llama.cpp server API key. Used only for protected status probes
+    /// such as `/slots`; profile scripts are also scanned for LLAMA_API_KEY.
+    #[serde(default)]
+    pub llama_server_api_key: Option<String>,
     pub agent_api_port: u16,
     pub agent_api_token: String,
     pub auto_rescan_on_startup: bool,
@@ -29,6 +33,17 @@ pub struct Settings {
     pub last_used_profile_id: Option<String>,
     pub stop_timeout_seconds: u64,
     pub health_check_timeout_seconds: u64,
+    /// Image names of the llama.cpp server binary. To guarantee a single running
+    /// server, every process matching one of these names is terminated before a
+    /// new one is launched (and on stop). Catches orphaned/detached servers and
+    /// strays bound to a non-configured port. `#[serde(default)]` keeps existing
+    /// settings.json files loading without resetting the user's other settings.
+    #[serde(default = "default_server_process_names")]
+    pub server_process_names: Vec<String>,
+}
+
+fn default_server_process_names() -> Vec<String> {
+    vec!["llama-server.exe".into()]
 }
 
 impl Default for Settings {
@@ -39,6 +54,7 @@ impl Default for Settings {
             allowed_extensions: vec![".cmd".into(), ".bat".into(), ".ps1".into()],
             server_port: 1234,
             health_url: "http://127.0.0.1:1234/health".to_string(),
+            llama_server_api_key: None,
             agent_api_port: 47891,
             agent_api_token: generate_token(),
             auto_rescan_on_startup: true,
@@ -48,6 +64,7 @@ impl Default for Settings {
             last_used_profile_id: None,
             stop_timeout_seconds: 15,
             health_check_timeout_seconds: 60,
+            server_process_names: default_server_process_names(),
         }
     }
 }

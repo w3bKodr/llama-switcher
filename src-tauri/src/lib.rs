@@ -15,10 +15,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use script_scanner::{Profile, ScanResult};
-use settings::Settings;
+use settings::{DefaultProfileMode, Settings};
 use state::{AppState, Status};
 
 use serde::Serialize;
+use tauri::image::Image;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 // ---------------------------------------------------------------------------
@@ -32,6 +33,7 @@ pub fn get_state(app: &AppHandle) -> Arc<AppState> {
 /// Show and focus the dashboard window, optionally navigating to a page.
 pub fn show_dashboard(app: &AppHandle, page: Option<&str>) {
     if let Some(win) = app.get_webview_window("main") {
+        apply_window_icon(app);
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
@@ -39,6 +41,47 @@ pub fn show_dashboard(app: &AppHandle, page: Option<&str>) {
             let _ = app.emit("navigate", p);
         }
     }
+}
+
+fn apply_window_icon(app: &AppHandle) {
+    let Some(win) = app.get_webview_window("main") else {
+        return;
+    };
+
+    if let Some(icon) = resolve_window_icon(app).and_then(|path| Image::from_path(path).ok()) {
+        let _ = win.set_icon(icon);
+    } else if let Some(icon) = app.default_window_icon().cloned() {
+        let _ = win.set_icon(icon);
+    }
+}
+
+fn resolve_window_icon(app: &AppHandle) -> Option<std::path::PathBuf> {
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let icon = resource_dir.join("window-icon.png");
+        if icon.is_file() {
+            return Some(icon);
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        for _ in 0..6 {
+            if let Some(d) = dir {
+                let icon = d.join("icons").join("window-icon.png");
+                if icon.is_file() {
+                    return Some(icon);
+                }
+                let icon = d.join("src-tauri").join("icons").join("window-icon.png");
+                if icon.is_file() {
+                    return Some(icon);
+                }
+                dir = d.parent().map(|p| p.to_path_buf());
+            } else {
+                break;
+            }
+        }
+    }
+    None
 }
 
 /// Re-scan the scripts folder, store the result, and refresh tray + UI.
@@ -101,6 +144,7 @@ fn save_settings(
         *s = settings.clone();
         s.save(&state.settings_path)?;
     }
+    *state.usage_probe_disabled.lock().unwrap() = false;
     // Reflect any folder/pattern change immediately.
     let st = state.inner().clone();
     rescan_and_store(&app, &st);
@@ -215,6 +259,11 @@ fn read_latest_log(state: State<'_, Arc<AppState>>) -> Result<String, String> {
 #[tauri::command]
 fn read_log(path: String) -> Result<String, String> {
     logging::read_log(std::path::Path::new(&path))
+}
+
+#[tauri::command]
+fn read_log_update(path: String, offset: u64) -> Result<logging::LogUpdate, String> {
+    logging::read_log_update(std::path::Path::new(&path), offset)
 }
 
 #[tauri::command]
@@ -355,7 +404,9 @@ pub fn run() {
 
             // Load settings + initial scan.
             let settings = Settings::load_or_init(&settings_path);
-            let scan = if settings.auto_rescan_on_startup {
+            let should_scan_on_startup = settings.auto_rescan_on_startup
+                || !matches!(settings.default_profile_mode, DefaultProfileMode::None);
+            let scan = if should_scan_on_startup {
                 script_scanner::scan(&settings)
             } else {
                 ScanResult::default()
@@ -364,12 +415,31 @@ pub fn run() {
 
             let state = Arc::new(AppState::new(settings, scan, settings_path, logs_dir));
             app.manage(state.clone());
+            apply_window_icon(&handle);
 
             // Tray icon + menu.
             tray::create(&handle)?;
 
             // Local control API on 127.0.0.1.
             local_api::start(handle.clone(), state.clone());
+
+            // Lightweight live monitor for tray state and open dashboards.
+            {
+                let h = handle.clone();
+                let s = state.clone();
+                std::thread::spawn(move || {
+                    let mut last_status: Option<Status> = None;
+                    loop {
+                        let status = process_manager::status_with_probe(&h, &s);
+                        tray::refresh_visual(&h, &status);
+                        if last_status.as_ref() != Some(&status) {
+                            let _ = h.emit("status-changed", &status);
+                            last_status = Some(status);
+                        }
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                });
+            }
 
             // Optional, opt-in periodic rescan (the only background loop).
             if let Some(interval) = auto_interval {
@@ -417,6 +487,7 @@ pub fn run() {
             restart_server,
             read_latest_log,
             read_log,
+            read_log_update,
             list_logs,
             clear_old_logs,
             open_logs_folder,

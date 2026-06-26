@@ -9,8 +9,9 @@ use crate::logging;
 use crate::process_tree;
 use crate::script_scanner::Profile;
 use crate::settings::{DefaultProfileMode, Settings};
-use crate::state::{AppState, RunningProcess, Status};
+use crate::state::{AppState, RunningProcess, Status, UsageState};
 use crate::tray;
+use serde_json::Value;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -33,13 +34,31 @@ pub fn notify(app: &AppHandle, state: &Arc<AppState>) {
 /// Quick health probe: returns true if the URL produced any HTTP response
 /// (even a 4xx/5xx), i.e. something is actually listening and answering.
 pub fn probe_reachable(url: &str) -> bool {
+    probe_health(url).reachable
+}
+
+struct HealthProbe {
+    reachable: bool,
+    healthy: bool,
+}
+
+fn probe_health(url: &str) -> HealthProbe {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(800))
         .build();
     match agent.get(url).call() {
-        Ok(_) => true,
-        Err(ureq::Error::Status(_, _)) => true,
-        Err(_) => false,
+        Ok(response) => HealthProbe {
+            reachable: true,
+            healthy: response.status() >= 200 && response.status() < 400,
+        },
+        Err(ureq::Error::Status(code, _)) => HealthProbe {
+            reachable: true,
+            healthy: (200..400).contains(&code),
+        },
+        Err(_) => HealthProbe {
+            reachable: false,
+            healthy: false,
+        },
     }
 }
 
@@ -48,11 +67,11 @@ pub fn probe_reachable(url: &str) -> bool {
 /// same profile under Llama Switcher so logs and lifecycle controls work.
 pub fn status_with_probe(app: &AppHandle, state: &Arc<AppState>) -> Status {
     let mut s = state.status();
-    let reachable = probe_reachable(&s.health_url);
-    s.server_reachable = reachable;
+    let health = probe_health(&s.health_url);
+    s.server_reachable = health.reachable;
     if s.running {
-        s.healthy = reachable;
-    } else if reachable {
+        s.healthy = health.healthy;
+    } else if health.reachable {
         let _takeover = state.takeover_lock.lock().unwrap();
 
         // Another caller may have completed takeover while we waited.
@@ -100,7 +119,251 @@ pub fn status_with_probe(app: &AppHandle, state: &Arc<AppState>) -> Status {
     } else {
         *state.external_pid_checked.lock().unwrap() = None;
     }
+    s.usage_state = if health.healthy && !*state.usage_probe_disabled.lock().unwrap() {
+        probe_usage_state(state, &s)
+    } else {
+        UsageState::Unknown
+    };
     s
+}
+
+fn probe_usage_state(state: &Arc<AppState>, status: &Status) -> UsageState {
+    let api_key = match usage_probe_api_key(state, status) {
+        Some(key) => key,
+        None => return UsageState::Unknown,
+    };
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_millis(800))
+        .build();
+
+    let url = format!("{}/slots", server_origin(&status.health_url, status.server_port));
+    let auth = format!("Bearer {}", api_key);
+    let response = match agent.get(&url).set("Authorization", &auth).call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(401 | 403, _)) => {
+            *state.usage_probe_disabled.lock().unwrap() = true;
+            return UsageState::Unknown;
+        }
+        Err(_) => return UsageState::Unknown,
+    };
+
+    let body = match response.into_string() {
+        Ok(body) => body,
+        Err(_) => return UsageState::Unknown,
+    };
+
+    let value: Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(_) => return UsageState::Unknown,
+    };
+
+    infer_usage_state(&value).unwrap_or(UsageState::Unknown)
+}
+
+fn usage_probe_api_key(state: &Arc<AppState>, status: &Status) -> Option<String> {
+    let script_key = status
+        .script_path
+        .as_deref()
+        .and_then(api_key_from_script)
+        .and_then(|key| non_empty(key.trim()));
+    let fallback_settings_key = state
+        .settings_snapshot()
+        .llama_server_api_key
+        .and_then(|key| non_empty(key.trim()));
+    script_key.or(fallback_settings_key)
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn api_key_from_script(path: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_api_key_from_script(&text)
+}
+
+fn parse_api_key_from_script(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if trimmed.is_empty() || lower.starts_with("rem ") || lower.starts_with('#') {
+            continue;
+        }
+
+        if let Some(value) = parse_env_assignment(trimmed, "LLAMA_API_KEY") {
+            return Some(value);
+        }
+        if let Some(value) = parse_flag_value(trimmed, "--api-key") {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn parse_env_assignment(line: &str, name: &str) -> Option<String> {
+    let mut s = line.trim();
+    if s.to_ascii_lowercase().starts_with("set ") {
+        s = s[4..].trim();
+    }
+    if s.starts_with('$') {
+        s = s.trim_start_matches('$');
+        if let Some(rest) = s.strip_prefix("env:") {
+            s = rest;
+        }
+    }
+    s = s.trim_matches('"').trim_matches('\'').trim();
+
+    let (left, right) = s.split_once('=')?;
+    let left = left.trim().trim_matches('"').trim_matches('\'');
+    if !left.eq_ignore_ascii_case(name) {
+        return None;
+    }
+
+    Some(clean_script_value(right))
+}
+
+fn parse_flag_value(line: &str, flag: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let flag_lower = flag.to_ascii_lowercase();
+    let pos = lower.find(&flag_lower)?;
+    let after = line[pos + flag.len()..].trim_start();
+    let value = if let Some(value) = after.strip_prefix('=') {
+        value.trim_start()
+    } else {
+        after
+    };
+    Some(clean_script_value(value))
+}
+
+fn clean_script_value(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('^')
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string()
+}
+
+fn server_origin(health_url: &str, server_port: u16) -> String {
+    if let Some((scheme, rest)) = health_url.split_once("://") {
+        let host = rest.split('/').next().unwrap_or_default();
+        if !host.is_empty() {
+            return format!("{}://{}", scheme, host);
+        }
+    }
+    format!("http://127.0.0.1:{}", server_port)
+}
+
+fn infer_usage_state(value: &Value) -> Option<UsageState> {
+    match value {
+        Value::Array(items) => {
+            let mut saw_free = false;
+            for item in items {
+                match infer_usage_state(item) {
+                    Some(UsageState::Busy) => return Some(UsageState::Busy),
+                    Some(UsageState::Free) => saw_free = true,
+                    _ => {}
+                }
+            }
+            saw_free.then_some(UsageState::Free)
+        }
+        Value::Object(map) => {
+            for key in [
+                "slots",
+                "data",
+                "result",
+                "items",
+                "list",
+                "slot",
+                "value",
+            ] {
+                if let Some(nested) = map.get(key) {
+                    if let Some(state) = infer_usage_state(nested) {
+                        return Some(state);
+                    }
+                }
+            }
+
+            for key in [
+                "is_processing",
+                "processing",
+                "is_generating",
+                "generating",
+                "busy",
+                "is_busy",
+                "active",
+                "is_idle",
+                "idle",
+                "in_use",
+            ] {
+                if let Some(flag) = map.get(key).and_then(Value::as_bool) {
+                    return Some(match key {
+                        "is_idle" | "idle" => {
+                            if flag {
+                                UsageState::Free
+                            } else {
+                                UsageState::Busy
+                            }
+                        }
+                        _ => {
+                            if flag {
+                                UsageState::Busy
+                            } else {
+                                UsageState::Free
+                            }
+                        }
+                    });
+                }
+            }
+
+            for key in ["state", "status"] {
+                if let Some(text) = map.get(key).and_then(Value::as_str) {
+                    let state = text.to_ascii_lowercase();
+                    if [
+                        "busy",
+                        "processing",
+                        "generating",
+                        "running",
+                        "prompt",
+                        "decode",
+                    ]
+                    .iter()
+                    .any(|needle| state.contains(needle))
+                    {
+                        return Some(UsageState::Busy);
+                    }
+                    if [
+                        "free",
+                        "idle",
+                        "ready",
+                        "available",
+                        "waiting",
+                    ]
+                    .iter()
+                    .any(|needle| state.contains(needle))
+                    {
+                        return Some(UsageState::Free);
+                    }
+                }
+            }
+
+            for key in ["n_processing", "processing_count", "active_requests", "queued_requests"] {
+                if let Some(count) = map.get(key).and_then(Value::as_u64) {
+                    return Some(if count > 0 {
+                        UsageState::Busy
+                    } else {
+                        UsageState::Free
+                    });
+                }
+            }
+
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Query the listener's process ancestry and match an ancestor command line to
@@ -198,18 +461,49 @@ pub fn is_port_free(port: u16) -> bool {
 // Stop
 // ---------------------------------------------------------------------------
 
+/// Terminate every stray server-binary process to guarantee a single instance.
+/// This is the catch-all that handles detached/orphaned servers (whose parent
+/// link is broken so a tree-walk can't find them) and strays bound to a
+/// non-configured port, which per-port reclamation alone would miss.
+fn enforce_single_server(app: &AppHandle, settings: &Settings, reason: &str) -> usize {
+    if settings.server_process_names.is_empty() {
+        return 0;
+    }
+    let count = process_tree::kill_all_by_image(&settings.server_process_names);
+    if count > 0 {
+        let _ = app.emit(
+            "warning",
+            format!(
+                "{}: terminated {} stray server process{} to enforce a single instance.",
+                reason,
+                count,
+                if count == 1 { "" } else { "es" }
+            ),
+        );
+    }
+    count
+}
+
 /// Stop the server on the configured port, whether it was launched by Llama
 /// Switcher or by another startup mechanism. Blocks until the port is free or
-/// the stop timeout elapses.
+/// the stop timeout elapses. Public entry — serialized via `op_lock`.
 pub fn stop_server(app: &AppHandle, state: &Arc<AppState>) -> Result<Status, String> {
+    let _op = state.op_lock.lock().unwrap();
+    stop_locked(app, state)
+}
+
+/// Stop implementation. Assumes the caller already holds `op_lock`.
+fn stop_locked(app: &AppHandle, state: &Arc<AppState>) -> Result<Status, String> {
     let settings = state.settings_snapshot();
     let mut rp = match state.running.lock().unwrap().take() {
         Some(rp) => rp,
         None => {
             stop_external_listener(app, &settings, "Stop requested")?;
+            enforce_single_server(app, &settings, "Stop");
             notify(app, state);
             *state.external_pid_checked.lock().unwrap() = None;
-            return Ok(status_with_probe(app, state));
+            *state.usage_probe_disabled.lock().unwrap() = false;
+            return Ok(state.status());
         }
     };
     notify(app, state);
@@ -244,6 +538,16 @@ pub fn stop_server(app: &AppHandle, state: &Arc<AppState>) -> Result<Status, Str
         }
     }
 
+    // Final sweep: terminate any stray server processes (detached, orphaned, or
+    // bound to a different port) so exactly zero servers remain after a stop.
+    let swept = enforce_single_server(app, &settings, "Stop");
+    if swept > 0 {
+        logging::append_line(
+            &log_path,
+            &format!("Swept {} stray server process(es) by image name.", swept),
+        );
+    }
+
     let port_free = is_port_free(settings.server_port);
     logging::append_line(
         &log_path,
@@ -258,6 +562,7 @@ pub fn stop_server(app: &AppHandle, state: &Arc<AppState>) -> Result<Status, Str
     );
 
     notify(app, state);
+    *state.usage_probe_disabled.lock().unwrap() = false;
 
     if !port_free {
         return Err(format!(
@@ -294,15 +599,24 @@ pub fn activate_profile(
         ));
     }
 
+    // Serialize the entire start/switch so two activations cannot race and
+    // leave two servers running. Held until the new server is launched.
+    let _op = state.op_lock.lock().unwrap();
+
     // Stop any currently running managed process (handles both switch & restart).
     if state.running.lock().unwrap().is_some() {
-        stop_server(app, state)?;
+        stop_locked(app, state)?;
     }
 
     // Always take ownership of the configured server port. This covers servers
     // launched at Windows sign-in, from a terminal, or by another application.
     ensure_port_available(app, &settings)?;
+
+    // Guarantee no stray server (any port, including orphans) survives before
+    // we launch exactly one.
+    enforce_single_server(app, &settings, "Start / Switch");
     *state.external_pid_checked.lock().unwrap() = None;
+    *state.usage_probe_disabled.lock().unwrap() = false;
 
     // Create the run log and launch the script.
     let log_path = logging::create_run_log(&state.logs_dir, &profile, None);
@@ -386,9 +700,6 @@ fn stop_external_listener(
 }
 
 fn spawn_script(profile: &Profile, log_path: &std::path::Path) -> Result<std::process::Child, String> {
-    let out = logging::open_for_append(log_path).map_err(|e| e.to_string())?;
-    let err = logging::open_for_append(log_path).map_err(|e| e.to_string())?;
-
     let ext = profile.extension.to_lowercase();
     let mut cmd;
     if ext == ".ps1" {
@@ -410,13 +721,24 @@ fn spawn_script(profile: &Profile, log_path: &std::path::Path) -> Result<std::pr
     }
 
     cmd.current_dir(&profile.working_directory);
-    cmd.stdout(Stdio::from(out));
-    cmd.stderr(Stdio::from(err));
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
     cmd.stdin(Stdio::null());
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    cmd.spawn().map_err(|e| format!("Failed to launch script: {}", e))
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to launch script: {}", e))?;
+
+    if let Some(stdout) = child.stdout.take() {
+        logging::spawn_filtered_pipe(log_path.to_path_buf(), stdout);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        logging::spawn_filtered_pipe(log_path.to_path_buf(), stderr);
+    }
+
+    Ok(child)
 }
 
 /// Poll the health URL until healthy or timeout, then stop polling. This is the
@@ -550,15 +872,38 @@ pub fn auto_start_if_configured(app: &AppHandle, state: &Arc<AppState>) {
         DefaultProfileMode::Specific => settings.default_profile_id.clone(),
     };
     if let Some(id) = id {
-        if state.find_profile(&id).is_some() {
-            let _ = activate_profile(app, state, &id);
+        for attempt in 0..15 {
+            if state.find_profile(&id).is_some() {
+                if let Err(error) = activate_profile(app, state, &id) {
+                    let _ = app.emit("warning", format!("Auto-start failed: {}", error));
+                }
+                return;
+            }
+
+            crate::rescan_and_store(app, state);
+            if state.find_profile(&id).is_some() {
+                if let Err(error) = activate_profile(app, state, &id) {
+                    let _ = app.emit("warning", format!("Auto-start failed: {}", error));
+                }
+                return;
+            }
+
+            if attempt < 14 {
+                thread::sleep(Duration::from_secs(2));
+            }
         }
+
+        let _ = app.emit(
+            "warning",
+            format!("Auto-start profile was not found after scanning: {}", id),
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn profile(path: &str, id: &str) -> Profile {
         Profile {
@@ -602,5 +947,49 @@ mod tests {
         let lines = vec![r#"CMD /C "START - QWEN-27B - VISION.CMD""#.to_string()];
 
         assert!(match_profile_command_lines(&profiles, &lines).is_some());
+    }
+
+    #[test]
+    fn infers_busy_usage_from_slots_payload() {
+        let payload = json!({
+            "slots": [
+                { "id": 0, "state": "idle" },
+                { "id": 1, "is_processing": true }
+            ]
+        });
+
+        assert_eq!(infer_usage_state(&payload), Some(UsageState::Busy));
+    }
+
+    #[test]
+    fn infers_free_usage_from_slots_payload() {
+        let payload = json!([
+            { "id": 0, "is_processing": false },
+            { "id": 1, "status": "idle" }
+        ]);
+
+        assert_eq!(infer_usage_state(&payload), Some(UsageState::Free));
+    }
+
+    #[test]
+    fn parses_cmd_llama_api_key_assignment() {
+        let script = r#"
+            @echo off
+            set "LLAMA_API_KEY=sk-test-123"
+            llama-server.exe --port 1234
+        "#;
+
+        assert_eq!(parse_api_key_from_script(script).as_deref(), Some("sk-test-123"));
+    }
+
+    #[test]
+    fn parses_api_key_flag_assignment() {
+        let script = r#"
+            llama-server.exe ^
+              --api-key sk-flag-456 ^
+              --port 1234
+        "#;
+
+        assert_eq!(parse_api_key_from_script(script).as_deref(), Some("sk-flag-456"));
     }
 }

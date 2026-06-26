@@ -24,12 +24,26 @@ pub struct AppState {
     pub settings: Mutex<Settings>,
     pub scan: Mutex<ScanResult>,
     pub running: Mutex<Option<RunningProcess>>,
+    /// Serializes start/stop/switch so two launches can never race and leave two
+    /// servers running. Held for the whole duration of an activate or stop.
+    pub op_lock: Mutex<()>,
     /// Serializes external-server detection/takeover and remembers an unknown
     /// listener so status polling does not repeatedly query process ancestry.
     pub takeover_lock: Mutex<()>,
     pub external_pid_checked: Mutex<Option<u32>>,
+    /// If the llama.cpp API protects `/slots`, disable usage probing for the
+    /// current run after the first 401/403 so logs do not fill with retries.
+    pub usage_probe_disabled: Mutex<bool>,
     pub settings_path: PathBuf,
     pub logs_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum UsageState {
+    Free,
+    Busy,
+    Unknown,
 }
 
 impl AppState {
@@ -38,8 +52,10 @@ impl AppState {
             settings: Mutex::new(settings),
             scan: Mutex::new(scan),
             running: Mutex::new(None),
+            op_lock: Mutex::new(()),
             takeover_lock: Mutex::new(()),
             external_pid_checked: Mutex::new(None),
+            usage_probe_disabled: Mutex::new(false),
             settings_path,
             logs_dir,
         }
@@ -65,7 +81,7 @@ impl AppState {
 }
 
 /// Serialized status returned to the frontend and the local API.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
     pub running: bool,
@@ -83,6 +99,7 @@ pub struct Status {
     pub server_port: u16,
     pub health_url: String,
     pub started_at: Option<String>,
+    pub usage_state: UsageState,
 }
 
 impl AppState {
@@ -104,6 +121,7 @@ impl AppState {
                 server_port: settings.server_port,
                 health_url: settings.health_url.clone(),
                 started_at: Some(rp.started_at.clone()),
+                usage_state: UsageState::Unknown,
             },
             None => Status {
                 running: false,
@@ -119,6 +137,7 @@ impl AppState {
                 server_port: settings.server_port,
                 health_url: settings.health_url.clone(),
                 started_at: None,
+                usage_state: UsageState::Unknown,
             },
         }
     }

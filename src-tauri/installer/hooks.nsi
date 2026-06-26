@@ -11,9 +11,16 @@
 !include "LogicLib.nsh"
 
 !macro NSIS_HOOK_POSTINSTALL
+  ; ---- Desktop shortcut icon refresh ----
+  ; Recreate the desktop shortcut with an explicit installed icon file so
+  ; Windows does not keep showing a stale cached icon from an older build.
+  Delete "$DESKTOP\${PRODUCTNAME}.lnk"
+  CreateShortcut "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe" "" "$INSTDIR\desktop-icon.ico" 0
+
   ; ---- Autostart (shell:startup) ----
   MessageBox MB_YESNO|MB_ICONQUESTION "Start Llama Switcher automatically when you sign in?" IDNO lbl_skip_autostart
-    CreateShortcut "$SMSTARTUP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
+    Delete "$SMSTARTUP\${PRODUCTNAME}.lnk"
+    CreateShortcut "$SMSTARTUP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe" "" "$INSTDIR\desktop-icon.ico" 0
   lbl_skip_autostart:
 
   ; ---- Optional Hermes skill install ----

@@ -85,14 +85,26 @@ body {
 }
 
 .nav-brand .dot {
-  width: 9px;
-  height: 9px;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
   background: var(--text-dim);
+  box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.03);
 }
 
-.nav-brand .dot.running {
+.nav-brand .dot.healthy {
   background: var(--green);
+  box-shadow: 0 0 0 4px rgba(92, 211, 138, 0.14), 0 0 18px rgba(92, 211, 138, 0.25);
+}
+
+.nav-brand .dot.busy {
+  background: var(--yellow);
+  box-shadow: 0 0 0 4px rgba(240, 198, 116, 0.14), 0 0 18px rgba(240, 198, 116, 0.24);
+}
+
+.nav-brand .dot.down {
+  background: var(--red);
+  box-shadow: 0 0 0 4px rgba(240, 138, 138, 0.14), 0 0 18px rgba(240, 138, 138, 0.24);
 }
 
 .nav-item {
@@ -148,6 +160,100 @@ h2 {
   border-radius: var(--radius);
   padding: 16px;
   margin-bottom: 14px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.18);
+}
+
+.status-card {
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at top right, rgba(110, 168, 254, 0.14), transparent 28%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0)),
+    var(--bg-elev);
+}
+
+.status-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 4px;
+  background: var(--accent);
+  opacity: 0.75;
+}
+
+.status-card.healthy::before {
+  background: var(--green);
+}
+
+.status-card.busy::before {
+  background: var(--yellow);
+}
+
+.status-card.down::before {
+  background: var(--red);
+}
+
+.status-hero {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.status-kicker {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+
+.status-title {
+  display: block;
+  font-size: 22px;
+  line-height: 1.2;
+  margin-bottom: 8px;
+}
+
+.status-pills {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.status-note {
+  max-width: 620px;
+  margin-bottom: 0;
+}
+
+.status-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.summary-chip {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+
+.summary-label {
+  display: block;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+
+.summary-value {
+  display: block;
+  font-size: 15px;
+  font-weight: 600;
 }
 
 .row {
@@ -261,6 +367,7 @@ button.btn.small {
 
 input[type="text"],
 input[type="number"],
+input[type="password"],
 select {
   background: var(--bg-input);
   border: 1px solid var(--border);
@@ -341,6 +448,7 @@ td.path {
   height: 50vh;
   overflow-y: auto;
   color: #cfd2d8;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
 }
 
 .toast {
@@ -391,4 +499,16 @@ pre.code-block {
   justify-content: space-between;
   align-items: center;
   gap: 12px;
+}
+
+@media (max-width: 860px) {
+  .status-hero,
+  .spread {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .status-summary {
+    grid-template-columns: 1fr;
+  }
 }

@@ -1,3 +1,5 @@
+import type { Status } from "../types";
+
 export type Page = "status" | "scripts" | "settings" | "logs" | "agent";
 
 const ITEMS: { key: Page; label: string }[] = [
@@ -11,16 +13,22 @@ const ITEMS: { key: Page; label: string }[] = [
 export function Nav({
   page,
   setPage,
-  running,
+  status,
 }: {
   page: Page;
   setPage: (p: Page) => void;
-  running: boolean;
+  status: Status | null;
 }) {
+  const dotClass = !status || (!status.running && !status.serverReachable)
+    ? "down"
+    : status.usageState === "busy" || (status.running && !status.healthy)
+      ? "busy"
+      : "healthy";
+
   return (
     <nav className="nav">
       <div className="nav-brand">
-        <span className={`dot ${running ? "running" : ""}`} />
+        <span className={`dot ${dotClass}`} />
         Llama Switcher
       </div>
       {ITEMS.map((it) => (

@@ -34,6 +34,7 @@ export interface Settings {
   allowedExtensions: string[];
   serverPort: number;
   healthUrl: string;
+  llamaServerApiKey: string | null;
   agentApiPort: number;
   agentApiToken: string;
   autoRescanOnStartup: boolean;
@@ -43,6 +44,9 @@ export interface Settings {
   lastUsedProfileId: string | null;
   stopTimeoutSeconds: number;
   healthCheckTimeoutSeconds: number;
+  // Image names of the llama.cpp server binary used to enforce a single running
+  // instance (e.g. ["llama-server.exe"]). Round-trips through the settings form.
+  serverProcessNames: string[];
 }
 
 export interface Status {
@@ -59,6 +63,7 @@ export interface Status {
   serverPort: number;
   healthUrl: string;
   startedAt: string | null;
+  usageState: "free" | "busy" | "unknown";
 }
 
 export interface AgentApiInfo {
@@ -72,4 +77,10 @@ export interface LogEntry {
   path: string;
   modifiedAt: string;
   sizeBytes: number;
+}
+
+export interface LogUpdate {
+  text: string;
+  nextOffset: number;
+  truncated: boolean;
 }

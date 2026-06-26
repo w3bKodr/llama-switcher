@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useState } from "react";
 import { api } from "../api";
 import { StatusCard } from "../components/StatusCard";
 import type { Status } from "../types";
@@ -13,23 +13,6 @@ export function StatusPage({
   showToast: (m: string, e?: boolean) => void;
 }) {
   const [busy, setBusy] = useState(false);
-  const [portLive, setPortLive] = useState<boolean>(status?.serverReachable ?? false);
-
-  // Light probe (no takeover side-effect) to decide if Stop should be enabled.
-  const checkPort = useCallback(async () => {
-    try {
-      setPortLive(await api.isServerReachable());
-    } catch {
-      setPortLive(false);
-    }
-  }, []);
-
-  // Probe every 3s so the Stop button reflects reality even for external servers.
-  useEffect(() => {
-    checkPort();
-    const id = setInterval(checkPort, 3000);
-    return () => clearInterval(id);
-  }, [checkPort]);
 
   async function run(label: string, fn: () => Promise<unknown>) {
     setBusy(true);
@@ -45,12 +28,12 @@ export function StatusPage({
   }
 
   const running = status?.running ?? false;
-  const serverPresent = running || portLive;
+  const serverPresent = running || (status?.serverReachable ?? false);
 
   return (
     <div>
       <h1>Status</h1>
-      <p className="subtitle">Current llama.cpp server managed by Llama Switcher.</p>
+      <p className="subtitle">Live server state, usage, and controls with automatic background refresh.</p>
 
       <StatusCard status={status} />
 

@@ -157,6 +157,20 @@ export function SettingsPage({
           />
         </div>
         <div className="field">
+          <label>llama.cpp API key for status probes</label>
+          <input
+            type="password"
+            className="mono"
+            value={settings.llamaServerApiKey ?? ""}
+            onChange={(e) => update("llamaServerApiKey", e.target.value || null)}
+            placeholder="Auto-detected from LLAMA_API_KEY when blank"
+          />
+          <span className="hint">
+            Used only if the running profile script does not set LLAMA_API_KEY.
+            Script keys are preferred so each model can use its own key.
+          </span>
+        </div>
+        <div className="field">
           <label>Stop timeout (seconds)</label>
           <input
             type="number"
@@ -173,6 +187,28 @@ export function SettingsPage({
               update("healthCheckTimeoutSeconds", Number(e.target.value))
             }
           />
+        </div>
+        <div className="field">
+          <label>Server binary name(s)</label>
+          <input
+            type="text"
+            value={settings.serverProcessNames.join(", ")}
+            onChange={(e) =>
+              update(
+                "serverProcessNames",
+                e.target.value
+                  .split(",")
+                  .map((n) => n.trim())
+                  .filter((n) => n.length > 0)
+              )
+            }
+          />
+          <span className="hint">
+            Comma-separated. Every process with one of these image names is
+            killed before a new server launches, guaranteeing only one runs at a
+            time. Default: <span className="mono">llama-server.exe</span>. Change
+            this if your llama.cpp binary has a different name.
+          </span>
         </div>
         <span className="hint">
           Start / Switch always stops the current process on this port first,
@@ -236,6 +272,11 @@ export function SettingsPage({
             }
           />
           <span className="hint">No polling occurs unless this is set.</span>
+          {settings.defaultProfileMode !== "none" && (
+            <span className="hint">
+              The selected startup profile is still scanned once when Llama Switcher launches.
+            </span>
+          )}
         </div>
 
         <div className="field">

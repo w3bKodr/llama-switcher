@@ -49,9 +49,40 @@ export default function App() {
     };
   }, [refreshStatus]);
 
+  useEffect(() => {
+    let alive = true;
+    let pending = false;
+
+    const tick = async () => {
+      if (!alive || pending || document.hidden) {
+        return;
+      }
+      pending = true;
+      try {
+        await refreshStatus();
+      } finally {
+        pending = false;
+      }
+    };
+
+    const interval = window.setInterval(tick, 2000);
+    const onVisibility = () => {
+      if (!document.hidden) {
+        void tick();
+      }
+    };
+
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      alive = false;
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [refreshStatus]);
+
   return (
     <div className="app">
-      <Nav page={page} setPage={setPage} running={status?.running ?? false} />
+      <Nav page={page} setPage={setPage} status={status} />
       <div className="content">
         {page === "status" && (
           <StatusPage status={status} onAction={refreshStatus} showToast={showToast} />
