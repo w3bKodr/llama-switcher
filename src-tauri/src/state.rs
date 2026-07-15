@@ -34,8 +34,27 @@ pub struct AppState {
     /// If the llama.cpp API protects `/slots`, disable usage probing for the
     /// current run after the first 401/403 so logs do not fill with retries.
     pub usage_probe_disabled: Mutex<bool>,
+    /// Baseline for the average generation tokens/sec, reset per model switch.
+    pub tps: Mutex<TpsTracker>,
+    /// True while a benchmark run owns the server; blocks manual switching.
+    pub benchmark_running: Mutex<bool>,
+    /// Set to request cancellation of the in-progress benchmark run.
+    pub benchmark_cancel: Mutex<bool>,
     pub settings_path: PathBuf,
     pub logs_dir: PathBuf,
+}
+
+/// Tracks average generation throughput for the currently running model.
+/// llama.cpp exposes cumulative counters (`llamacpp:tokens_predicted_total` and
+/// `llamacpp:tokens_predicted_seconds_total`); the average since this model
+/// started is `Δtokens / Δseconds` relative to the baseline captured on the
+/// first sample after a switch.
+#[derive(Default)]
+pub struct TpsTracker {
+    /// Profile id these counters belong to; cleared when the model changes.
+    pub profile_id: Option<String>,
+    /// (tokens_predicted_total, tokens_predicted_seconds_total) at first sample.
+    pub baseline: Option<(f64, f64)>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -56,6 +75,9 @@ impl AppState {
             takeover_lock: Mutex::new(()),
             external_pid_checked: Mutex::new(None),
             usage_probe_disabled: Mutex::new(false),
+            tps: Mutex::new(TpsTracker::default()),
+            benchmark_running: Mutex::new(false),
+            benchmark_cancel: Mutex::new(false),
             settings_path,
             logs_dir,
         }
@@ -81,7 +103,8 @@ impl AppState {
 }
 
 /// Serialized status returned to the frontend and the local API.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// (No `Eq`: `avg_tokens_per_second` is an `f64`.)
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
     pub running: bool,
@@ -100,6 +123,9 @@ pub struct Status {
     pub health_url: String,
     pub started_at: Option<String>,
     pub usage_state: UsageState,
+    /// Average generation tokens/sec for the running model since it started.
+    /// `None` when unavailable (metrics not reachable, no requests yet).
+    pub avg_tokens_per_second: Option<f64>,
 }
 
 impl AppState {
@@ -122,6 +148,7 @@ impl AppState {
                 health_url: settings.health_url.clone(),
                 started_at: Some(rp.started_at.clone()),
                 usage_state: UsageState::Unknown,
+                avg_tokens_per_second: None,
             },
             None => Status {
                 running: false,
@@ -138,6 +165,7 @@ impl AppState {
                 health_url: settings.health_url.clone(),
                 started_at: None,
                 usage_state: UsageState::Unknown,
+                avg_tokens_per_second: None,
             },
         }
     }

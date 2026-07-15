@@ -171,6 +171,14 @@ where
 {
     std::thread::spawn(move || {
         let state = crate::get_state(&app);
+        if crate::benchmark::is_running(&state) {
+            let _ = tauri::Emitter::emit(
+                &app,
+                "warning",
+                "A benchmark is running; server controls are disabled until it finishes.".to_string(),
+            );
+            return;
+        }
         if let Err(e) = op(app.clone(), state) {
             let _ = tauri::Emitter::emit(&app, "warning", e);
         }

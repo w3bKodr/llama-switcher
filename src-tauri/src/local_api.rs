@@ -81,6 +81,20 @@ fn handle(app: &AppHandle, state: &Arc<AppState>, mut request: tiny_http::Reques
         return;
     }
 
+    // Block server-control actions while a benchmark owns the server.
+    let mutating = matches!(
+        path.as_str(),
+        "/start" | "/switch" | "/switch-by-name" | "/switch-by-alias" | "/restart" | "/stop"
+    );
+    if mutating && crate::benchmark::is_running(state) {
+        respond(
+            request,
+            409,
+            json!({ "error": "A benchmark is running; server controls are disabled until it finishes." }),
+        );
+        return;
+    }
+
     let result: Result<Value, (u16, String)> = match (method.clone(), path.as_str()) {
         (Method::Get, "/status") => Ok(status_to_json(&pm::status_with_probe(app, state))),
 

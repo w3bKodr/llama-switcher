@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Nav, type Page } from "./components/Nav";
 import { StatusPage } from "./pages/StatusPage";
 import { DetectedScriptsPage } from "./pages/DetectedScriptsPage";
+import { BenchmarkPage } from "./pages/BenchmarkPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { LogsPage } from "./pages/LogsPage";
 import { AgentControlPage } from "./pages/AgentControlPage";
@@ -90,6 +91,11 @@ export default function App() {
         {page === "scripts" && (
           <DetectedScriptsPage status={status} onAction={refreshStatus} showToast={showToast} />
         )}
+        {/* Keep BenchmarkPage mounted so a running benchmark's progress, timers,
+            and prompt edits survive tab switches; just hide it when inactive. */}
+        <div style={{ display: page === "benchmark" ? "block" : "none" }}>
+          <BenchmarkPage showToast={showToast} active={page === "benchmark"} />
+        </div>
         {page === "settings" && <SettingsPage showToast={showToast} />}
         {page === "logs" && <LogsPage showToast={showToast} />}
         {page === "agent" && <AgentControlPage showToast={showToast} />}

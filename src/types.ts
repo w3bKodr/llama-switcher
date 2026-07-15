@@ -60,10 +60,36 @@ export interface Status {
   pid: number | null;
   healthy: boolean;
   serverReachable: boolean;
+  avgTokensPerSecond: number | null;
   serverPort: number;
   healthUrl: string;
   startedAt: string | null;
   usageState: "free" | "busy" | "unknown";
+}
+
+export interface BenchmarkPrompt {
+  id: string;
+  title: string;
+  text: string;
+}
+
+export interface BenchmarkConfig {
+  profileIds: string[];
+  prompts: BenchmarkPrompt[];
+  outputDir: string;
+  timeoutSeconds: number;
+}
+
+export interface BenchmarkProgress {
+  kind: "run" | "model" | "prompt";
+  status: "running" | "done" | "error" | "switching" | "finished" | "cancelled";
+  profileId: string | null;
+  alias: string | null;
+  promptId: string | null;
+  outputPath: string | null;
+  message: string | null;
+  durationSeconds: number | null;
+  tokensPerSecond: number | null;
 }
 
 export interface AgentApiInfo {

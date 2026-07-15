@@ -70,8 +70,12 @@ export function StatusCard({ status }: { status: Status | null }) {
 
       <div className="status-summary">
         <div className="summary-chip">
-          <span className="summary-label">State</span>
-          <span className="summary-value">{state.label}</span>
+          <span className="summary-label">Avg Tk/s</span>
+          <span className="summary-value">
+            {status.avgTokensPerSecond != null
+              ? status.avgTokensPerSecond.toFixed(1)
+              : "—"}
+          </span>
         </div>
         <div className="summary-chip">
           <span className="summary-label">Model</span>

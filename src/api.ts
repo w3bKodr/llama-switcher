@@ -2,6 +2,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentApiInfo,
+  BenchmarkConfig,
   LogEntry,
   LogUpdate,
   Profile,
@@ -47,4 +48,14 @@ export const api = {
   detectHermesSkillDirs: () => invoke<string[]>("detect_hermes_skill_dirs"),
   installHermesSkill: (targetDir: string) =>
     invoke<string>("install_hermes_skill", { targetDir }),
+
+  getBenchmarkConfig: () => invoke<BenchmarkConfig>("get_benchmark_config"),
+  saveBenchmarkConfig: (config: BenchmarkConfig) =>
+    invoke<void>("save_benchmark_config", { config }),
+  runBenchmark: (config: BenchmarkConfig) =>
+    invoke<void>("run_benchmark", { config }),
+  cancelBenchmark: () => invoke<void>("cancel_benchmark"),
+  isBenchmarkRunning: () => invoke<boolean>("is_benchmark_running"),
+
+  openPath: (path: string) => invoke<void>("open_path", { path }),
 };

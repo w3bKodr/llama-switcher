@@ -1,6 +1,7 @@
 //! Llama Switcher — lightweight Windows tray app for llama.cpp profiles.
 
 mod alias_formatter;
+mod benchmark;
 mod hermes_install;
 mod local_api;
 mod logging;
@@ -28,6 +29,15 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 pub fn get_state(app: &AppHandle) -> Arc<AppState> {
     app.state::<Arc<AppState>>().inner().clone()
+}
+
+/// Reject server-control actions while a benchmark owns the server.
+fn ensure_not_benchmarking(state: &Arc<AppState>) -> Result<(), String> {
+    if benchmark::is_running(state) {
+        Err("A benchmark is running; server controls are disabled until it finishes or is cancelled.".into())
+    } else {
+        Ok(())
+    }
 }
 
 /// Show and focus the dashboard window, optionally navigating to a page.
@@ -173,6 +183,7 @@ async fn start_profile(
     state: State<'_, Arc<AppState>>,
     profile_id: String,
 ) -> Result<Status, String> {
+    ensure_not_benchmarking(state.inner())?;
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         process_manager::activate_profile(&app, &st, &profile_id)
@@ -187,6 +198,7 @@ async fn switch_profile(
     state: State<'_, Arc<AppState>>,
     profile_id: String,
 ) -> Result<Status, String> {
+    ensure_not_benchmarking(state.inner())?;
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         process_manager::activate_profile(&app, &st, &profile_id)
@@ -202,6 +214,7 @@ async fn switch_profile_by_name(
     model: String,
     feature: String,
 ) -> Result<Status, String> {
+    ensure_not_benchmarking(state.inner())?;
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let id = process_manager::resolve_name(&st, &model, &feature)?;
@@ -217,6 +230,7 @@ async fn switch_profile_by_alias(
     state: State<'_, Arc<AppState>>,
     alias: String,
 ) -> Result<Status, String> {
+    ensure_not_benchmarking(state.inner())?;
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let id = process_manager::resolve_alias(&st, &alias)?;
@@ -231,6 +245,7 @@ async fn stop_server(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Status, String> {
+    ensure_not_benchmarking(state.inner())?;
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || process_manager::stop_server(&app, &st))
         .await
@@ -242,10 +257,43 @@ async fn restart_server(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Status, String> {
+    ensure_not_benchmarking(state.inner())?;
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || process_manager::restart_server(&app, &st))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn get_benchmark_config(state: State<'_, Arc<AppState>>) -> benchmark::BenchmarkConfig {
+    benchmark::load_config(state.inner())
+}
+
+#[tauri::command]
+fn save_benchmark_config(
+    state: State<'_, Arc<AppState>>,
+    config: benchmark::BenchmarkConfig,
+) -> Result<(), String> {
+    benchmark::save_config(state.inner(), &config)
+}
+
+#[tauri::command]
+fn run_benchmark(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    config: benchmark::BenchmarkConfig,
+) -> Result<(), String> {
+    benchmark::start(app, state.inner().clone(), config)
+}
+
+#[tauri::command]
+fn cancel_benchmark(state: State<'_, Arc<AppState>>) {
+    benchmark::cancel(state.inner());
+}
+
+#[tauri::command]
+fn is_benchmark_running(state: State<'_, Arc<AppState>>) -> bool {
+    benchmark::is_running(state.inner())
 }
 
 #[tauri::command]
@@ -284,6 +332,11 @@ fn open_logs_folder(state: State<'_, Arc<AppState>>) {
 #[tauri::command]
 fn open_scripts_folder(state: State<'_, Arc<AppState>>) {
     open_folder(&state.settings_snapshot().scripts_folder);
+}
+
+#[tauri::command]
+fn open_path(path: String) {
+    open_folder(&path);
 }
 
 #[derive(Serialize)]
@@ -492,11 +545,17 @@ pub fn run() {
             clear_old_logs,
             open_logs_folder,
             open_scripts_folder,
+            open_path,
             get_agent_api_info,
             regenerate_agent_api_token,
             browse_folder,
             detect_hermes_skill_dirs,
-            install_hermes_skill
+            install_hermes_skill,
+            get_benchmark_config,
+            save_benchmark_config,
+            run_benchmark,
+            cancel_benchmark,
+            is_benchmark_running
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

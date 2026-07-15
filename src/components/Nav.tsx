@@ -1,10 +1,11 @@
 import type { Status } from "../types";
 
-export type Page = "status" | "scripts" | "settings" | "logs" | "agent";
+export type Page = "status" | "scripts" | "benchmark" | "settings" | "logs" | "agent";
 
 const ITEMS: { key: Page; label: string }[] = [
   { key: "status", label: "Status" },
   { key: "scripts", label: "Detected Scripts" },
+  { key: "benchmark", label: "Benchmark" },
   { key: "settings", label: "Settings" },
   { key: "logs", label: "Logs" },
   { key: "agent", label: "Agent Control" },

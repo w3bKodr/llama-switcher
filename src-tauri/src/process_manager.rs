@@ -124,7 +124,65 @@ pub fn status_with_probe(app: &AppHandle, state: &Arc<AppState>) -> Status {
     } else {
         UsageState::Unknown
     };
+    s.avg_tokens_per_second = if health.healthy {
+        probe_avg_tps(state, &s)
+    } else {
+        None
+    };
     s
+}
+
+/// Read llama.cpp's cumulative generation counters from `/metrics` and return
+/// the average generation tokens/sec for the current model since it started.
+/// Reuses the same API key discovery as the `/slots` usage probe.
+fn probe_avg_tps(state: &Arc<AppState>, status: &Status) -> Option<f64> {
+    let api_key = usage_probe_api_key(state, status)?;
+    let url = format!("{}/metrics", server_origin(&status.health_url, status.server_port));
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_millis(800))
+        .build();
+    let body = match agent
+        .get(&url)
+        .set("Authorization", &format!("Bearer {}", api_key))
+        .call()
+    {
+        Ok(response) => response.into_string().ok()?,
+        Err(_) => return None,
+    };
+
+    let tokens = parse_prometheus_metric(&body, "llamacpp:tokens_predicted_total")?;
+    let seconds = parse_prometheus_metric(&body, "llamacpp:tokens_predicted_seconds_total")?;
+
+    let mut tracker = state.tps.lock().unwrap();
+    // Re-baseline if the model changed since the last sample.
+    if tracker.profile_id != status.current_profile_id {
+        tracker.profile_id = status.current_profile_id.clone();
+        tracker.baseline = None;
+    }
+    let (base_tokens, base_seconds) = *tracker.baseline.get_or_insert((tokens, seconds));
+
+    let d_tokens = tokens - base_tokens;
+    let d_seconds = seconds - base_seconds;
+    if d_seconds > 0.05 && d_tokens > 0.0 {
+        Some(d_tokens / d_seconds)
+    } else {
+        None
+    }
+}
+
+/// Parse a single unlabeled Prometheus metric value (`name value`).
+fn parse_prometheus_metric(body: &str, name: &str) -> Option<f64> {
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some(name) {
+            return parts.next()?.parse::<f64>().ok();
+        }
+    }
+    None
 }
 
 fn probe_usage_state(state: &Arc<AppState>, status: &Status) -> UsageState {
@@ -162,9 +220,14 @@ fn probe_usage_state(state: &Arc<AppState>, status: &Status) -> UsageState {
 }
 
 fn usage_probe_api_key(state: &Arc<AppState>, status: &Status) -> Option<String> {
-    let script_key = status
-        .script_path
-        .as_deref()
+    resolve_api_key(state, status.script_path.as_deref())
+}
+
+/// Resolve the llama.cpp bearer key: the profile script's `LLAMA_API_KEY` /
+/// `--api-key` first, then the settings fallback. Shared by the usage probe,
+/// the metrics probe, and the benchmark runner.
+pub fn resolve_api_key(state: &Arc<AppState>, script_path: Option<&str>) -> Option<String> {
+    let script_key = script_path
         .and_then(api_key_from_script)
         .and_then(|key| non_empty(key.trim()));
     let fallback_settings_key = state
@@ -247,7 +310,7 @@ fn clean_script_value(value: &str) -> String {
         .to_string()
 }
 
-fn server_origin(health_url: &str, server_port: u16) -> String {
+pub fn server_origin(health_url: &str, server_port: u16) -> String {
     if let Some((scheme, rest)) = health_url.split_once("://") {
         let host = rest.split('/').next().unwrap_or_default();
         if !host.is_empty() {
@@ -617,6 +680,12 @@ pub fn activate_profile(
     enforce_single_server(app, &settings, "Start / Switch");
     *state.external_pid_checked.lock().unwrap() = None;
     *state.usage_probe_disabled.lock().unwrap() = false;
+    // Reset the tokens/sec average so it re-accumulates for the new model.
+    {
+        let mut tracker = state.tps.lock().unwrap();
+        tracker.profile_id = Some(profile.id.clone());
+        tracker.baseline = None;
+    }
 
     // Create the run log and launch the script.
     let log_path = logging::create_run_log(&state.logs_dir, &profile, None);
@@ -904,6 +973,27 @@ pub fn auto_start_if_configured(app: &AppHandle, state: &Arc<AppState>) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parses_prometheus_generation_counters() {
+        // Real sample captured from a running llama.cpp `/metrics`.
+        let body = "# HELP llamacpp:tokens_predicted_total ...\n\
+            llamacpp:prompt_tokens_total 2.67172e+06\n\
+            llamacpp:tokens_predicted_total 373356\n\
+            llamacpp:tokens_predicted_seconds_total 2872.4\n\
+            llamacpp:predicted_tokens_seconds 129.981\n";
+        let tokens = parse_prometheus_metric(body, "llamacpp:tokens_predicted_total").unwrap();
+        let seconds =
+            parse_prometheus_metric(body, "llamacpp:tokens_predicted_seconds_total").unwrap();
+        assert_eq!(tokens, 373356.0);
+        assert!((seconds - 2872.4).abs() < 1e-6);
+        // Scientific notation parses too.
+        let prompt = parse_prometheus_metric(body, "llamacpp:prompt_tokens_total").unwrap();
+        assert!((prompt - 2_671_720.0).abs() < 1.0);
+        // Average generation speed ≈ tokens / seconds.
+        assert!(((tokens / seconds) - 129.98).abs() < 0.1);
+        assert!(parse_prometheus_metric(body, "llamacpp:does_not_exist").is_none());
+    }
 
     fn profile(path: &str, id: &str) -> Profile {
         Profile {
