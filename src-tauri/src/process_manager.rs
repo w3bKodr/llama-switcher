@@ -233,24 +233,41 @@ fn probe_vram(server_pid: Option<u32>) -> VramStatus {
     }
 }
 
-/// Read Windows' per-process dedicated GPU-memory counters. PowerShell's
-/// Get-Counter is considerably slower than nvidia-smi, so cache it briefly;
-/// status itself is refreshed every two seconds.
-fn probe_windows_vram_processes() -> Vec<VramProcess> {
-    static CACHE: OnceLock<Mutex<(Instant, Vec<VramProcess>)>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| {
-        Mutex::new((
-            Instant::now()
-                .checked_sub(Duration::from_secs(60))
-                .unwrap_or_else(Instant::now),
-            Vec::new(),
-        ))
-    });
-    let mut cached = cache.lock().unwrap();
-    if cached.0.elapsed() < Duration::from_secs(8) {
-        return cached.1.clone();
-    }
+#[derive(Default)]
+struct VramProcessCache {
+    sampled_at: Option<Instant>,
+    processes: Vec<VramProcess>,
+    refreshing: bool,
+}
 
+/// Return the most recent Windows per-process VRAM sample immediately. A slow
+/// Get-Counter refresh runs in the background so it never stalls status, tray,
+/// or UI refresh calls.
+fn probe_windows_vram_processes() -> Vec<VramProcess> {
+    static CACHE: OnceLock<Arc<Mutex<VramProcessCache>>> = OnceLock::new();
+    let cache = Arc::clone(CACHE.get_or_init(|| Arc::new(Mutex::new(VramProcessCache::default()))));
+    let mut cached = cache.lock().unwrap();
+    let fresh = cached
+        .sampled_at
+        .is_some_and(|sampled_at| sampled_at.elapsed() < Duration::from_secs(8));
+    if fresh || cached.refreshing {
+        return cached.processes.clone();
+    }
+    cached.refreshing = true;
+    let current = cached.processes.clone();
+    drop(cached);
+
+    thread::spawn(move || {
+        let processes = query_windows_vram_processes();
+        let mut cached = cache.lock().unwrap();
+        cached.processes = processes;
+        cached.sampled_at = Some(Instant::now());
+        cached.refreshing = false;
+    });
+    current
+}
+
+fn query_windows_vram_processes() -> Vec<VramProcess> {
     let script = "$usage=@{}; (Get-Counter '\\GPU Process Memory(*)\\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | ForEach-Object { if ($_.InstanceName -match '^pid_(\\d+)_') { $processId=[uint32]$Matches[1]; $usage[$processId]=[double]($usage[$processId])+[double]$_.CookedValue } }; $usage.GetEnumerator() | ForEach-Object { $process=Get-Process -Id $_.Key -ErrorAction SilentlyContinue; if ($process -and $_.Value -ge 1048576) { '{0}|{1}|{2}' -f $_.Key,$process.ProcessName,[long]$_.Value } }";
     let mut processes = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
@@ -276,8 +293,6 @@ fn probe_windows_vram_processes() -> Vec<VramProcess> {
         })
         .unwrap_or_default();
     processes.sort_by(|a, b| b.used_mib.cmp(&a.used_mib));
-    cached.0 = Instant::now();
-    cached.1 = processes.clone();
     processes
 }
 
@@ -773,6 +788,41 @@ fn enforce_single_server(app: &AppHandle, settings: &Settings, reason: &str) -> 
         );
     }
     count
+}
+
+/// Live watchdog: preserve the managed server tree (or the recognized external
+/// listener) and terminate any other configured server binary. `try_lock`
+/// keeps the watchdog out of the way during an active start/stop/switch.
+pub fn sweep_stale_servers(app: &AppHandle, state: &Arc<AppState>, status: &Status) {
+    let Ok(_operation) = state.op_lock.try_lock() else {
+        return;
+    };
+    let settings = state.settings_snapshot();
+    if settings.server_process_names.is_empty() {
+        return;
+    }
+
+    let managed_root = state
+        .running
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|running| running.pid);
+    let allowed = managed_root
+        .or_else(|| status.server_reachable.then_some(status.pid).flatten())
+        .map(process_tree::descendants)
+        .unwrap_or_default();
+    let count = process_tree::kill_all_by_image_except(&settings.server_process_names, &allowed);
+    if count > 0 {
+        let _ = app.emit(
+            "warning",
+            format!(
+                "Watchdog terminated {} rogue or stale server process{}.",
+                count,
+                if count == 1 { "" } else { "es" }
+            ),
+        );
+    }
 }
 
 /// Stop the server on the configured port, whether it was launched by Llama

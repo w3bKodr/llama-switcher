@@ -93,7 +93,21 @@ mod imp {
         let pids = pids_by_image(names);
         let count = pids.len();
         for pid in pids {
-            kill_tree(pid);
+            kill_parent_tree(pid);
+        }
+        count
+    }
+
+    /// Terminate matching processes except PIDs in the managed server tree.
+    pub fn kill_all_by_image_except(names: &[String], allowed: &[u32]) -> usize {
+        let allowed: HashSet<u32> = allowed.iter().copied().collect();
+        let pids: Vec<u32> = pids_by_image(names)
+            .into_iter()
+            .filter(|pid| !allowed.contains(pid))
+            .collect();
+        let count = pids.len();
+        for pid in pids {
+            kill_parent_tree(pid);
         }
         count
     }
@@ -164,17 +178,28 @@ mod imp {
     /// Killing the parent tree terminates both the script AND all
     /// its children, breaking restart loops.
     ///
-    /// Safety: refuses to kill PID 0 (system) or PID 4 (csrss.exe).
-pub fn kill_parent_tree(pid: u32) {
+    /// A parent is terminated only when it is a known script host. This avoids
+    /// taking down unrelated parents such as Explorer or a terminal app.
+    pub fn kill_parent_tree(pid: u32) {
         if let Some(ppid) = parent_of(pid) {
-            if ppid != 0 && ppid != 4 {
+            let parent_name = snapshot_named()
+                .into_iter()
+                .find_map(|(candidate, name)| (candidate == ppid).then_some(name));
+            let is_script_host = parent_name.as_deref().is_some_and(|name| {
+                matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "cmd.exe" | "powershell.exe" | "pwsh.exe" | "wscript.exe" | "cscript.exe"
+                )
+            });
+            if ppid != 0 && ppid != 4 && is_script_host {
                 kill_tree(ppid);
             } else {
-                // Parent is a system process — just kill the target itself.
-                terminate(pid);
+                // Parent is unrelated or a system process; kill only the
+                // target server and its own descendants.
+                kill_tree(pid);
             }
         } else {
-            terminate(pid);
+            kill_tree(pid);
         }
     }
 }
@@ -192,6 +217,11 @@ mod imp {
     pub fn kill_all_by_image(_names: &[String]) -> usize {
         0
     }
+    pub fn kill_all_by_image_except(_names: &[String], _allowed: &[u32]) -> usize {
+        0
+    }
 }
 
-pub use imp::{descendants, kill_all_by_image, kill_parent_tree, kill_tree};
+pub use imp::{
+    descendants, kill_all_by_image, kill_all_by_image_except, kill_parent_tree, kill_tree,
+};

@@ -484,6 +484,7 @@ pub fn run() {
                     let mut last_status: Option<Status> = None;
                     loop {
                         let status = process_manager::status_with_probe(&h, &s);
+                        process_manager::sweep_stale_servers(&h, &s, &status);
                         tray::refresh_visual(&h, &status);
                         if last_status.as_ref() != Some(&status) {
                             let _ = h.emit("status-changed", &status);
