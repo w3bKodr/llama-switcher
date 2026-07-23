@@ -65,6 +65,21 @@ export interface Status {
   healthUrl: string;
   startedAt: string | null;
   usageState: "free" | "busy" | "unknown";
+  vram: VramStatus;
+}
+
+export interface VramStatus {
+  totalMib: number | null;
+  usedMib: number | null;
+  freeMib: number | null;
+  modelMib: number | null;
+  processes: VramProcess[];
+}
+
+export interface VramProcess {
+  pid: number;
+  name: string;
+  usedMib: number;
 }
 
 export interface BenchmarkPrompt {

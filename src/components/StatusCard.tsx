@@ -1,12 +1,8 @@
 import type { Status } from "../types";
 
-function Row({ label, value }: { label: string; value: React.ReactNode }) {
-  return (
-    <div className="row">
-      <span className="label">{label}</span>
-      <span className="value">{value ?? "-"}</span>
-    </div>
-  );
+function formatVram(mib: number | null) {
+  if (mib == null) return "—";
+  return `${(mib / 1024).toFixed(mib >= 10_240 ? 0 : 1)} GB`;
 }
 
 function stateMeta(status: Status) {
@@ -46,7 +42,7 @@ export function StatusCard({ status }: { status: Status | null }) {
 
   const state = stateMeta(status);
   const title = status.running
-    ? status.alias
+    ? status.model
     : status.serverReachable
       ? "Externally started server"
       : "No server running";
@@ -55,8 +51,9 @@ export function StatusCard({ status }: { status: Status | null }) {
     <div className={`card status-card ${state.tone}`}>
       <div className="status-hero">
         <div>
-          <div className="status-kicker">Current server</div>
+          <div className="status-kicker">Current model</div>
           <strong className="status-title">{title ?? "Unknown profile"}</strong>
+          {status.feature && <span className="status-feature">{status.feature}</span>}
           {!status.running && status.serverReachable && (
             <p className="subtitle status-note">
               Llama Switcher can stop this server directly or replace it the next time you switch profiles.
@@ -78,24 +75,81 @@ export function StatusCard({ status }: { status: Status | null }) {
           </span>
         </div>
         <div className="summary-chip">
-          <span className="summary-label">Model</span>
-          <span className="summary-value">{status.model ?? "-"}</span>
+          <span className="summary-label">Health</span>
+          <span className="summary-value">{healthLabel(status)}</span>
         </div>
         <div className="summary-chip">
-          <span className="summary-label">Feature</span>
-          <span className="summary-value">{status.feature ?? "-"}</span>
+          <span className="summary-label">Usage</span>
+          <span className="summary-value">{usageLabel(status)}</span>
         </div>
       </div>
 
-      <Row label="Model" value={status.model} />
-      <Row label="Feature" value={status.feature} />
-      <Row label="Health" value={healthLabel(status)} />
-      <Row label="Usage" value={usageLabel(status)} />
-      <Row label="PID" value={status.pid} />
-      <Row label="Server URL" value={`http://127.0.0.1:${status.serverPort}`} />
-      <Row label="Health URL" value={status.healthUrl} />
-      <Row label="Script path" value={<span className="mono">{status.scriptPath}</span>} />
-      <Row label="Started" value={status.startedAt} />
+      <section className="vram-card" aria-label="VRAM usage">
+        <div className="vram-heading">
+          <div>
+            <span className="status-kicker">GPU memory</span>
+            <strong>VRAM</strong>
+          </div>
+          <span className="vram-total">
+            {status.vram.totalMib == null
+              ? "NVIDIA GPU unavailable"
+              : `${formatVram(status.vram.freeMib)} available`}
+          </span>
+        </div>
+        {status.vram.totalMib != null ? (
+          <>
+            <div className="vram-bar" aria-label={`${formatVram(status.vram.usedMib)} of ${formatVram(status.vram.totalMib)} in use`}>
+              <span style={{ width: `${Math.min(100, ((status.vram.usedMib ?? 0) / status.vram.totalMib) * 100)}%` }} />
+            </div>
+            <div className="vram-details">
+              <span><b>{formatVram(status.vram.usedMib)}</b> used of {formatVram(status.vram.totalMib)}</span>
+              <span><b>{formatVram(status.vram.modelMib)}</b> server allocation</span>
+            </div>
+            <details className="vram-processes">
+                <summary>VRAM by process <span>{status.vram.processes.length || "Unavailable"}</span></summary>
+                <div className="vram-process-list">
+                  {status.vram.processes.length > 0 ? status.vram.processes.map((process) => (
+                    <div className="vram-process" key={process.pid}>
+                      <span title={process.name}>{process.name}</span>
+                      <small>PID {process.pid}</small>
+                      <b>{formatVram(process.usedMib)}</b>
+                    </div>
+                  )) : (
+                    <p className="vram-process-unavailable">
+                      No active GPU processes were reported by Windows.
+                    </p>
+                  )}
+                </div>
+                {status.vram.processes.length > 0 && (
+                  <p className="vram-process-note">
+                    Windows compositor memory is excluded because it duplicates app surfaces.
+                  </p>
+                )}
+            </details>
+          </>
+        ) : (
+          <p className="vram-unavailable">Install or update the NVIDIA driver to display live GPU memory.</p>
+        )}
+      </section>
+
+      <div className="status-details">
+        <div className="status-detail">
+          <span>Server</span>
+          <b>127.0.0.1:{status.serverPort}</b>
+        </div>
+        <div className="status-detail">
+          <span>Process</span>
+          <b>{status.pid ? `PID ${status.pid}` : "—"}</b>
+        </div>
+        <div className="status-detail">
+          <span>Started</span>
+          <b>{status.startedAt ?? "—"}</b>
+        </div>
+        <div className="status-detail" title={status.scriptPath ?? undefined}>
+          <span>Launch script</span>
+          <b className="detail-script">{status.scriptPath?.split(/[\\/]/).pop() ?? "—"}</b>
+        </div>
+      </div>
     </div>
   );
 }

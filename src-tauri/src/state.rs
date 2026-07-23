@@ -44,17 +44,26 @@ pub struct AppState {
     pub logs_dir: PathBuf,
 }
 
-/// Tracks average generation throughput for the currently running model.
-/// llama.cpp exposes cumulative counters (`llamacpp:tokens_predicted_total` and
-/// `llamacpp:tokens_predicted_seconds_total`); the average since this model
-/// started is `Δtokens / Δseconds` relative to the baseline captured on the
-/// first sample after a switch.
+/// Tracks average generation throughput for the currently running model, reset
+/// on each model switch. Two sources, in priority order:
+///  1. llama.cpp `/metrics` cumulative counters (`llamacpp:tokens_predicted_total`
+///     and `..._seconds_total`); the average is Δtokens / Δseconds vs the
+///     baseline captured on the first sample.
+///  2. Fallback: the captured run log's per-request `eval time = X ms / Y tokens`
+///     generation lines, summed. This works with forks (e.g. beellama) that do
+///     not expose the `/metrics` counters.
 #[derive(Default)]
 pub struct TpsTracker {
     /// Profile id these counters belong to; cleared when the model changes.
     pub profile_id: Option<String>,
-    /// (tokens_predicted_total, tokens_predicted_seconds_total) at first sample.
-    pub baseline: Option<(f64, f64)>,
+    /// Metrics source: (tokens_predicted_total, tokens_predicted_seconds_total)
+    /// at the first sample.
+    pub metrics_baseline: Option<(f64, f64)>,
+    /// Log source: byte offset already consumed from the run log.
+    pub log_offset: u64,
+    /// Log source: cumulative generation tokens and milliseconds parsed so far.
+    pub log_gen_tokens: f64,
+    pub log_gen_ms: f64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -126,6 +135,29 @@ pub struct Status {
     /// Average generation tokens/sec for the running model since it started.
     /// `None` when unavailable (metrics not reachable, no requests yet).
     pub avg_tokens_per_second: Option<f64>,
+    /// Live GPU memory snapshot from NVIDIA's local tooling, when available.
+    pub vram: VramStatus,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VramStatus {
+    /// NVIDIA GPU memory totals, combined when multiple GPUs are present.
+    pub total_mib: Option<u64>,
+    pub used_mib: Option<u64>,
+    pub free_mib: Option<u64>,
+    /// Memory used by the active llama-server process.
+    pub model_mib: Option<u64>,
+    /// NVIDIA compute processes currently holding GPU memory.
+    pub processes: Vec<VramProcess>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VramProcess {
+    pub pid: u32,
+    pub name: String,
+    pub used_mib: u64,
 }
 
 impl AppState {
@@ -149,6 +181,7 @@ impl AppState {
                 started_at: Some(rp.started_at.clone()),
                 usage_state: UsageState::Unknown,
                 avg_tokens_per_second: None,
+                vram: VramStatus::default(),
             },
             None => Status {
                 running: false,
@@ -166,6 +199,7 @@ impl AppState {
                 started_at: None,
                 usage_state: UsageState::Unknown,
                 avg_tokens_per_second: None,
+                vram: VramStatus::default(),
             },
         }
     }

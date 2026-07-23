@@ -9,11 +9,11 @@ use crate::logging;
 use crate::process_tree;
 use crate::script_scanner::Profile;
 use crate::settings::{DefaultProfileMode, Settings};
-use crate::state::{AppState, RunningProcess, Status, UsageState};
+use crate::state::{AppState, RunningProcess, Status, UsageState, VramProcess, VramStatus};
 use crate::tray;
 use serde_json::Value;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
@@ -129,38 +129,200 @@ pub fn status_with_probe(app: &AppHandle, state: &Arc<AppState>) -> Status {
     } else {
         None
     };
+    s.vram = probe_vram(s.pid);
     s
 }
 
-/// Read llama.cpp's cumulative generation counters from `/metrics` and return
-/// the average generation tokens/sec for the current model since it started.
-/// Reuses the same API key discovery as the `/slots` usage probe.
+/// Query NVIDIA GPU memory without adding a CUDA dependency. The executable is
+/// installed alongside the driver, so absence simply means this stays empty.
+fn probe_vram(server_pid: Option<u32>) -> VramStatus {
+    let output = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.total,memory.used,memory.free",
+            "--format=csv,noheader,nounits",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    let Ok(output) = output else {
+        return VramStatus::default();
+    };
+    if !output.status.success() {
+        return VramStatus::default();
+    }
+
+    let mut total_mib = 0;
+    let mut used_mib = 0;
+    let mut free_mib = 0;
+    let mut gpu_found = false;
+    for row in String::from_utf8_lossy(&output.stdout).lines() {
+        let values: Vec<_> = row.split(',').map(|value| value.trim().parse::<u64>()).collect();
+        if let [Ok(total), Ok(used), Ok(free)] = values.as_slice() {
+            total_mib += total;
+            used_mib += used;
+            free_mib += free;
+            gpu_found = true;
+        }
+    }
+    if !gpu_found {
+        return VramStatus::default();
+    }
+
+    let mut processes: Vec<VramProcess> = Vec::new();
+    if let Ok(output) = Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid,process_name,used_memory",
+            "--format=csv,noheader,nounits",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        if output.status.success() {
+            for row in String::from_utf8_lossy(&output.stdout).lines() {
+                let mut values = row.split(',').map(str::trim);
+                let (Some(pid), Some(name), Some(used_mib)) = (values.next(), values.next(), values.next()) else {
+                    continue;
+                };
+                let (Ok(pid), Ok(used_mib)) = (pid.parse::<u32>(), used_mib.parse::<u64>()) else {
+                    continue;
+                };
+                // A process can have an entry per GPU. Present one clear total.
+                if let Some(existing) = processes.iter_mut().find(|process| process.pid == pid) {
+                    existing.used_mib += used_mib;
+                } else {
+                    processes.push(VramProcess {
+                        pid,
+                        name: name.to_string(),
+                        used_mib,
+                    });
+                }
+            }
+        }
+    }
+    processes.sort_by(|a, b| b.used_mib.cmp(&a.used_mib));
+    // Under Windows' WDDM driver mode, nvidia-smi often reports total VRAM but
+    // omits every process. Windows' own GPU counters expose those allocations.
+    let mut windows_processes = probe_windows_vram_processes();
+    if !windows_processes.is_empty() {
+        // DWM mirrors application surfaces for desktop composition. Its
+        // Dedicated Usage is already attributed to the owning applications,
+        // so including it makes the process rows exceed physical VRAM usage.
+        windows_processes.retain(|process| !process.name.eq_ignore_ascii_case("dwm"));
+        processes = windows_processes;
+        let process_used_mib = processes.iter().map(|process| process.used_mib).sum::<u64>();
+        // Keep the headline and the breakdown on the same Windows accounting
+        // basis when the cleaned allocation total is physically possible.
+        if process_used_mib > 0 && process_used_mib <= total_mib {
+            used_mib = process_used_mib;
+            free_mib = total_mib - process_used_mib;
+        }
+    }
+    let model_mib = server_pid.and_then(|pid| {
+        processes
+            .iter()
+            .find(|process| process.pid == pid)
+            .map(|process| process.used_mib)
+    });
+
+    VramStatus {
+        total_mib: Some(total_mib),
+        used_mib: Some(used_mib),
+        free_mib: Some(free_mib),
+        model_mib,
+        processes,
+    }
+}
+
+/// Read Windows' per-process dedicated GPU-memory counters. PowerShell's
+/// Get-Counter is considerably slower than nvidia-smi, so cache it briefly;
+/// status itself is refreshed every two seconds.
+fn probe_windows_vram_processes() -> Vec<VramProcess> {
+    static CACHE: OnceLock<Mutex<(Instant, Vec<VramProcess>)>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        Mutex::new((
+            Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .unwrap_or_else(Instant::now),
+            Vec::new(),
+        ))
+    });
+    let mut cached = cache.lock().unwrap();
+    if cached.0.elapsed() < Duration::from_secs(8) {
+        return cached.1.clone();
+    }
+
+    let script = "$usage=@{}; (Get-Counter '\\GPU Process Memory(*)\\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | ForEach-Object { if ($_.InstanceName -match '^pid_(\\d+)_') { $processId=[uint32]$Matches[1]; $usage[$processId]=[double]($usage[$processId])+[double]$_.CookedValue } }; $usage.GetEnumerator() | ForEach-Object { $process=Get-Process -Id $_.Key -ErrorAction SilentlyContinue; if ($process -and $_.Value -ge 1048576) { '{0}|{1}|{2}' -f $_.Key,$process.ProcessName,[long]$_.Value } }";
+    let mut processes = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|row| {
+                    let mut values = row.trim().splitn(3, '|');
+                    let pid = values.next()?.parse::<u32>().ok()?;
+                    let name = values.next()?.trim();
+                    let bytes = values.next()?.parse::<u64>().ok()?;
+                    Some(VramProcess {
+                        pid,
+                        name: name.to_string(),
+                        used_mib: (bytes + 524_288) / 1_048_576,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    processes.sort_by(|a, b| b.used_mib.cmp(&a.used_mib));
+    cached.0 = Instant::now();
+    cached.1 = processes.clone();
+    processes
+}
+
+/// Average generation tokens/sec for the current model since it started.
+/// Prefers llama.cpp `/metrics` counters; falls back to parsing the run log
+/// (for forks like beellama that do not expose those counters).
 fn probe_avg_tps(state: &Arc<AppState>, status: &Status) -> Option<f64> {
+    // Re-baseline everything when the model changes.
+    {
+        let mut t = state.tps.lock().unwrap();
+        if t.profile_id != status.current_profile_id {
+            *t = crate::state::TpsTracker {
+                profile_id: status.current_profile_id.clone(),
+                ..Default::default()
+            };
+        }
+    }
+
+    if let Some(v) = probe_metrics_tps(state, status) {
+        return Some(v);
+    }
+    probe_log_tps(state)
+}
+
+/// Source 1: llama.cpp `/metrics` cumulative counters, reusing the `/slots`
+/// API key. Returns None on 401/missing so the log fallback can run.
+fn probe_metrics_tps(state: &Arc<AppState>, status: &Status) -> Option<f64> {
     let api_key = usage_probe_api_key(state, status)?;
     let url = format!("{}/metrics", server_origin(&status.health_url, status.server_port));
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(800))
         .build();
-    let body = match agent
+    let body = agent
         .get(&url)
         .set("Authorization", &format!("Bearer {}", api_key))
         .call()
-    {
-        Ok(response) => response.into_string().ok()?,
-        Err(_) => return None,
-    };
+        .ok()?
+        .into_string()
+        .ok()?;
 
     let tokens = parse_prometheus_metric(&body, "llamacpp:tokens_predicted_total")?;
     let seconds = parse_prometheus_metric(&body, "llamacpp:tokens_predicted_seconds_total")?;
 
-    let mut tracker = state.tps.lock().unwrap();
-    // Re-baseline if the model changed since the last sample.
-    if tracker.profile_id != status.current_profile_id {
-        tracker.profile_id = status.current_profile_id.clone();
-        tracker.baseline = None;
-    }
-    let (base_tokens, base_seconds) = *tracker.baseline.get_or_insert((tokens, seconds));
-
+    let mut t = state.tps.lock().unwrap();
+    let (base_tokens, base_seconds) = *t.metrics_baseline.get_or_insert((tokens, seconds));
     let d_tokens = tokens - base_tokens;
     let d_seconds = seconds - base_seconds;
     if d_seconds > 0.05 && d_tokens > 0.0 {
@@ -168,6 +330,72 @@ fn probe_avg_tps(state: &Arc<AppState>, status: &Status) -> Option<f64> {
     } else {
         None
     }
+}
+
+/// Source 2: parse the managed run log incrementally for generation
+/// `eval time = X ms / Y tokens` lines and average tokens/sec since model start.
+fn probe_log_tps(state: &Arc<AppState>) -> Option<f64> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let log_path = state
+        .running
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|rp| rp.log_path.clone())?;
+    let mut file = std::fs::File::open(&log_path).ok()?;
+    let len = file.metadata().ok()?.len();
+
+    let mut t = state.tps.lock().unwrap();
+    // Log rotated/truncated — restart the accumulation.
+    if t.log_offset > len {
+        t.log_offset = 0;
+        t.log_gen_tokens = 0.0;
+        t.log_gen_ms = 0.0;
+    }
+    file.seek(SeekFrom::Start(t.log_offset)).ok()?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+
+    // Only consume up to the last complete line so we never split a line.
+    let consumed = buf.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    for line in buf[..consumed].lines() {
+        if let Some((tokens, ms)) = parse_gen_eval_line(line) {
+            t.log_gen_tokens += tokens;
+            t.log_gen_ms += ms;
+        }
+    }
+    t.log_offset += consumed as u64;
+
+    if t.log_gen_ms > 0.0 && t.log_gen_tokens > 0.0 {
+        Some(t.log_gen_tokens / (t.log_gen_ms / 1000.0))
+    } else {
+        None
+    }
+}
+
+/// Parse a llama.cpp generation timing line, returning (tokens, milliseconds).
+/// Matches `... eval time = <ms> ms / <n> tokens (...)` but NOT `prompt eval
+/// time` (prompt processing) or `total time`.
+fn parse_gen_eval_line(line: &str) -> Option<(f64, f64)> {
+    if line.contains("prompt eval time") {
+        return None;
+    }
+    let idx = line.find("eval time =")?;
+    let rest = &line[idx + "eval time =".len()..];
+    let ms = parse_leading_f64(rest)?;
+    let slash = rest.find('/')?;
+    let tokens = parse_leading_f64(&rest[slash + 1..])?;
+    Some((tokens, ms))
+}
+
+/// Parse the first numeric token (skipping leading whitespace) as f64.
+fn parse_leading_f64(s: &str) -> Option<f64> {
+    let s = s.trim_start();
+    let end = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(s.len());
+    s[..end].parse::<f64>().ok()
 }
 
 /// Parse a single unlabeled Prometheus metric value (`name value`).
@@ -683,8 +911,10 @@ pub fn activate_profile(
     // Reset the tokens/sec average so it re-accumulates for the new model.
     {
         let mut tracker = state.tps.lock().unwrap();
-        tracker.profile_id = Some(profile.id.clone());
-        tracker.baseline = None;
+        *tracker = crate::state::TpsTracker {
+            profile_id: Some(profile.id.clone()),
+            ..Default::default()
+        };
     }
 
     // Create the run log and launch the script.
@@ -993,6 +1223,27 @@ mod tests {
         // Average generation speed ≈ tokens / seconds.
         assert!(((tokens / seconds) - 129.98).abs() < 0.1);
         assert!(parse_prometheus_metric(body, "llamacpp:does_not_exist").is_none());
+    }
+
+    #[test]
+    fn parses_generation_eval_lines_from_log() {
+        // Generation line -> (tokens, ms).
+        let gen = "1.53.184.575 I slot print_timing: id  0 | task 205 |        eval time =    1919.06 ms /    74 tokens (   25.93 ms per token,    38.56 tokens per second)";
+        assert_eq!(parse_gen_eval_line(gen), Some((74.0, 1919.06)));
+
+        // Prompt-processing lines must be ignored.
+        let prompt = "1.37.109.438 I slot print_timing: id  0 | task 144 | prompt eval time =    7083.14 ms /  8535 tokens (    0.83 ms per token,  1204.97 tokens per second)";
+        assert!(parse_gen_eval_line(prompt).is_none());
+
+        // total time and streaming (tg) lines are not generation eval lines.
+        assert!(parse_gen_eval_line("... |       total time =    8582.90 ms /  8597 tokens").is_none());
+        assert!(parse_gen_eval_line("... | n_decoded =    100, tg = 111.10 t/s").is_none());
+
+        // Cumulative average over two generations.
+        let (t1, m1) = parse_gen_eval_line(gen).unwrap();
+        let (t2, m2) = parse_gen_eval_line("eval time = 1499.76 ms / 62 tokens ( 24.19 ms per token, 41.34 tokens per second)").unwrap();
+        let avg = (t1 + t2) / ((m1 + m2) / 1000.0);
+        assert!((avg - 39.78).abs() < 0.1);
     }
 
     fn profile(path: &str, id: &str) -> Profile {

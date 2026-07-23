@@ -31,13 +31,13 @@ export function StatusPage({
   const serverPresent = running || (status?.serverReachable ?? false);
 
   return (
-    <div>
+    <div className="status-page">
       <h1>Status</h1>
       <p className="subtitle">Live server state, usage, and controls with automatic background refresh.</p>
 
       <StatusCard status={status} />
 
-      <div className="btn-row">
+      <div className="btn-row status-actions">
         <button
           className="btn danger"
           disabled={busy || !serverPresent}
