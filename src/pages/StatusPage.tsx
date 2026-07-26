@@ -28,8 +28,6 @@ export function StatusPage({
   }
 
   const running = status?.running ?? false;
-  const serverPresent = running || (status?.serverReachable ?? false);
-
   return (
     <div className="status-page">
       <h1>Status</h1>
@@ -40,7 +38,7 @@ export function StatusPage({
       <div className="btn-row status-actions">
         <button
           className="btn danger"
-          disabled={busy || !serverPresent}
+          disabled={busy}
           onClick={() => run("Stop", api.stopServer)}
         >
           Stop

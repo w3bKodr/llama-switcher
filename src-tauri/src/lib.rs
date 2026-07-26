@@ -245,7 +245,9 @@ async fn stop_server(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Status, String> {
-    ensure_not_benchmarking(state.inner())?;
+    // Stop is the emergency escape hatch: it always cancels an active
+    // benchmark before shutting down the server.
+    benchmark::cancel_and_stop(&app, state.inner());
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || process_manager::stop_server(&app, &st))
         .await
@@ -287,8 +289,8 @@ fn run_benchmark(
 }
 
 #[tauri::command]
-fn cancel_benchmark(state: State<'_, Arc<AppState>>) {
-    benchmark::cancel(state.inner());
+fn cancel_benchmark(app: AppHandle, state: State<'_, Arc<AppState>>) {
+    benchmark::cancel(&app, state.inner());
 }
 
 #[tauri::command]

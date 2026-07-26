@@ -84,7 +84,7 @@ fn handle(app: &AppHandle, state: &Arc<AppState>, mut request: tiny_http::Reques
     // Block server-control actions while a benchmark owns the server.
     let mutating = matches!(
         path.as_str(),
-        "/start" | "/switch" | "/switch-by-name" | "/switch-by-alias" | "/restart" | "/stop"
+        "/start" | "/switch" | "/switch-by-name" | "/switch-by-alias" | "/restart"
     );
     if mutating && crate::benchmark::is_running(state) {
         respond(
@@ -149,9 +149,12 @@ fn handle(app: &AppHandle, state: &Arc<AppState>, mut request: tiny_http::Reques
             .map(|s| status_to_json(&s))
             .map_err(|e| (400, e)),
 
-        (Method::Post, "/stop") => pm::stop_server(app, state)
-            .map(|s| status_to_json(&s))
-            .map_err(|e| (400, e)),
+        (Method::Post, "/stop") => {
+            crate::benchmark::cancel_and_stop(app, state);
+            pm::stop_server(app, state)
+                .map(|s| status_to_json(&s))
+                .map_err(|e| (400, e))
+        }
 
         (Method::Post, "/open-dashboard") => {
             crate::show_dashboard(app, None);

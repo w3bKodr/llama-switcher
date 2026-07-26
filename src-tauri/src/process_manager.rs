@@ -208,7 +208,7 @@ fn probe_vram(server_pid: Option<u32>) -> VramStatus {
         // Dedicated Usage is already attributed to the owning applications,
         // so including it makes the process rows exceed physical VRAM usage.
         windows_processes.retain(|process| !process.name.eq_ignore_ascii_case("dwm"));
-        processes = windows_processes;
+        processes = reconcile_vram_processes(windows_processes, total_mib, server_pid);
         let process_used_mib = processes.iter().map(|process| process.used_mib).sum::<u64>();
         // Keep the headline and the breakdown on the same Windows accounting
         // basis when the cleaned allocation total is physically possible.
@@ -217,12 +217,21 @@ fn probe_vram(server_pid: Option<u32>) -> VramStatus {
             free_mib = total_mib - process_used_mib;
         }
     }
-    let model_mib = server_pid.and_then(|pid| {
-        processes
-            .iter()
-            .find(|process| process.pid == pid)
-            .map(|process| process.used_mib)
-    });
+    let model_mib = server_pid
+        .and_then(|pid| {
+            processes
+                .iter()
+                .find(|process| process.pid == pid)
+                .map(|process| process.used_mib)
+        })
+        // The tracked PID is usually the launch shell. Find its llama-server
+        // child by name when Windows attributes the allocation to that child.
+        .or_else(|| {
+            processes
+                .iter()
+                .find(|process| is_llama_server_process(&process.name))
+                .map(|process| process.used_mib)
+        });
 
     VramStatus {
         total_mib: Some(total_mib),
@@ -231,6 +240,39 @@ fn probe_vram(server_pid: Option<u32>) -> VramStatus {
         model_mib,
         processes,
     }
+}
+
+fn is_llama_server_process(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with("llama-server")
+}
+
+/// Windows GPU Process Memory counters can retain an allocation after a PID is
+/// reused and can report overlapping WDDM allocations for multiple processes.
+/// Prefer the active server and only expose a physically possible combination.
+fn reconcile_vram_processes(
+    mut processes: Vec<VramProcess>,
+    total_mib: u64,
+    server_pid: Option<u32>,
+) -> Vec<VramProcess> {
+    processes.retain(|process| process.used_mib > 0 && process.used_mib <= total_mib);
+    processes.sort_by(|a, b| {
+        let a_is_server = Some(a.pid) == server_pid || is_llama_server_process(&a.name);
+        let b_is_server = Some(b.pid) == server_pid || is_llama_server_process(&b.name);
+        b_is_server
+            .cmp(&a_is_server)
+            .then_with(|| b.used_mib.cmp(&a.used_mib))
+    });
+
+    let mut accounted_mib = 0_u64;
+    processes.retain(|process| {
+        if accounted_mib.saturating_add(process.used_mib) > total_mib {
+            return false;
+        }
+        accounted_mib += process.used_mib;
+        true
+    });
+    processes.sort_by(|a, b| b.used_mib.cmp(&a.used_mib));
+    processes
 }
 
 #[derive(Default)]
@@ -1253,6 +1295,41 @@ pub fn auto_start_if_configured(app: &AppHandle, state: &Arc<AppState>) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn vram_process(pid: u32, name: &str, used_mib: u64) -> VramProcess {
+        VramProcess {
+            pid,
+            name: name.into(),
+            used_mib,
+        }
+    }
+
+    #[test]
+    fn filters_impossible_overlapping_windows_vram_allocations() {
+        let processes = vec![
+            vram_process(40_120, "llama-server", 23_000),
+            vram_process(22_184, "firefox", 20_000),
+            vram_process(12_832, "explorer", 80),
+        ];
+
+        let reconciled = reconcile_vram_processes(processes, 24_576, Some(11_736));
+
+        assert!(reconciled.iter().any(|process| process.name == "llama-server"));
+        assert!(reconciled.iter().any(|process| process.name == "explorer"));
+        assert!(!reconciled.iter().any(|process| process.name == "firefox"));
+        assert!(reconciled.iter().map(|process| process.used_mib).sum::<u64>() <= 24_576);
+    }
+
+    #[test]
+    fn retains_multiple_real_allocations_that_fit() {
+        let processes = vec![
+            vram_process(101, "llama-server", 12_000),
+            vram_process(202, "renderer", 10_000),
+        ];
+
+        let reconciled = reconcile_vram_processes(processes, 24_576, Some(101));
+        assert_eq!(reconciled.len(), 2);
+    }
 
     #[test]
     fn parses_prometheus_generation_counters() {

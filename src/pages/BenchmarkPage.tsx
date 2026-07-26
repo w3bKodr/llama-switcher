@@ -194,7 +194,8 @@ export function BenchmarkPage({
   async function cancel() {
     try {
       await api.cancelBenchmark();
-      showToast("Cancelling after the current step…");
+      setRunning(false);
+      showToast("Benchmark cancelled.");
     } catch (e) {
       showToast(String(e), true);
     }

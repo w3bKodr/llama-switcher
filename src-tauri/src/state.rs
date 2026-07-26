@@ -40,6 +40,9 @@ pub struct AppState {
     pub benchmark_running: Mutex<bool>,
     /// Set to request cancellation of the in-progress benchmark run.
     pub benchmark_cancel: Mutex<bool>,
+    /// Monotonically increasing run identity. Cancellation invalidates the
+    /// active generation so late results cannot affect a newer run.
+    pub benchmark_generation: Mutex<u64>,
     pub settings_path: PathBuf,
     pub logs_dir: PathBuf,
 }
@@ -87,6 +90,7 @@ impl AppState {
             tps: Mutex::new(TpsTracker::default()),
             benchmark_running: Mutex::new(false),
             benchmark_cancel: Mutex::new(false),
+            benchmark_generation: Mutex::new(0),
             settings_path,
             logs_dir,
         }

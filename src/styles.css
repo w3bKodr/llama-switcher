@@ -439,11 +439,22 @@ h2 {
 }
 
 .status-actions {
-  position: sticky;
+  position: fixed;
+  left: 190px;
+  right: 0;
   bottom: 0;
-  z-index: 2;
-  padding: 10px 0 2px;
-  background: linear-gradient(180deg, rgba(27, 29, 33, 0), var(--bg) 32%);
+  z-index: 20;
+  min-height: 58px;
+  margin: 0;
+  padding: 10px 24px;
+  align-items: center;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+  box-shadow: 0 -8px 22px rgba(0, 0, 0, 0.22);
+}
+
+.status-page {
+  padding-bottom: 58px;
 }
 
 button.btn {

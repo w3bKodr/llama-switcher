@@ -122,7 +122,7 @@ export function StatusCard({ status }: { status: Status | null }) {
                 </div>
                 {status.vram.processes.length > 0 && (
                   <p className="vram-process-note">
-                    Windows compositor memory is excluded because it duplicates app surfaces.
+                    Stale and overlapping Windows GPU allocations are filtered to match physical VRAM.
                   </p>
                 )}
             </details>

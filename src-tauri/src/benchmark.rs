@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
@@ -116,20 +116,47 @@ pub fn is_running(state: &Arc<AppState>) -> bool {
     *state.benchmark_running.lock().unwrap()
 }
 
-pub fn cancel(state: &Arc<AppState>) {
-    *state.benchmark_cancel.lock().unwrap() = true;
+pub fn cancel(app: &AppHandle, state: &Arc<AppState>) {
+    invalidate_run(app, state);
 }
 
-fn cancelled(state: &Arc<AppState>) -> bool {
+/// Emergency cancellation used by the Status-page Stop button. Unlike the
+/// normal benchmark Cancel action, this leaves the server stopped.
+pub fn cancel_and_stop(app: &AppHandle, state: &Arc<AppState>) {
+    invalidate_run(app, state);
+}
+
+fn invalidate_run(app: &AppHandle, state: &Arc<AppState>) {
+    let mut running = state.benchmark_running.lock().unwrap();
+    let was_running = *running;
+    *running = false;
+    *state.benchmark_cancel.lock().unwrap() = true;
+    *state.benchmark_generation.lock().unwrap() += 1;
+    drop(running);
+    if was_running {
+        emit(app, Progress {
+            kind: "run".into(),
+            status: "cancelled".into(),
+            profile_id: None,
+            alias: None,
+            prompt_id: None,
+            output_path: None,
+            message: None,
+            duration_seconds: None,
+            tokens_per_second: None,
+        });
+        process_manager::notify(app, state);
+    }
+}
+
+fn cancelled(state: &Arc<AppState>, generation: u64) -> bool {
     *state.benchmark_cancel.lock().unwrap()
+        || *state.benchmark_generation.lock().unwrap() != generation
 }
 
 /// Validate + start a run on a background thread. Returns an error if a run is
 /// already in progress or the config is invalid.
 pub fn start(app: AppHandle, state: Arc<AppState>, config: BenchmarkConfig) -> Result<(), String> {
-    if is_running(&state) {
-        return Err("A benchmark is already running.".into());
-    }
     if config.profile_ids.is_empty() {
         return Err("Select at least one model.".into());
     }
@@ -139,14 +166,26 @@ pub fn start(app: AppHandle, state: Arc<AppState>, config: BenchmarkConfig) -> R
     if config.output_dir.trim().is_empty() {
         return Err("Choose an output folder.".into());
     }
+    let generation = {
+        let mut running = state.benchmark_running.lock().unwrap();
+        if *running {
+            return Err("A benchmark is already running.".into());
+        }
+        *state.benchmark_cancel.lock().unwrap() = false;
+        let mut generation = state.benchmark_generation.lock().unwrap();
+        *generation += 1;
+        *running = true;
+        *generation
+    };
     let _ = save_config(&state, &config);
-    std::thread::spawn(move || run_inner(&app, &state, config));
+    std::thread::spawn(move || run_inner(&app, &state, config, generation));
     Ok(())
 }
 
-fn run_inner(app: &AppHandle, state: &Arc<AppState>, config: BenchmarkConfig) {
-    *state.benchmark_running.lock().unwrap() = true;
-    *state.benchmark_cancel.lock().unwrap() = false;
+fn run_inner(app: &AppHandle, state: &Arc<AppState>, config: BenchmarkConfig, generation: u64) {
+    if cancelled(state, generation) {
+        return;
+    }
     emit(app, Progress {
         kind: "run".into(),
         status: "running".into(),
@@ -168,7 +207,7 @@ fn run_inner(app: &AppHandle, state: &Arc<AppState>, config: BenchmarkConfig) {
     }
 
     'models: for profile_id in &config.profile_ids {
-        if cancelled(state) {
+        if cancelled(state, generation) {
             break;
         }
         let profile = match state.find_profile(profile_id) {
@@ -191,7 +230,7 @@ fn run_inner(app: &AppHandle, state: &Arc<AppState>, config: BenchmarkConfig) {
                 emit_model(app, profile_id, Some(&profile.alias), "error", Some(e));
                 continue;
             }
-            if !wait_healthy(app, state, settings.health_check_timeout_seconds) {
+            if !wait_healthy(app, state, settings.health_check_timeout_seconds, generation) {
                 emit_model(
                     app,
                     profile_id,
@@ -209,7 +248,7 @@ fn run_inner(app: &AppHandle, state: &Arc<AppState>, config: BenchmarkConfig) {
         let model_dir = Path::new(&config.output_dir).join(sanitize_alias(&profile.alias));
 
         for (i, prompt) in config.prompts.iter().enumerate() {
-            if cancelled(state) {
+            if cancelled(state, generation) {
                 break 'models;
             }
             let prompt_dir = model_dir.join(format!("prompt{}", i + 1));
@@ -218,14 +257,20 @@ fn run_inner(app: &AppHandle, state: &Arc<AppState>, config: BenchmarkConfig) {
                 None,
             );
 
-            match run_prompt(
+            let result = run_prompt_cancellable(
+                state,
+                generation,
                 &origin,
                 api_key.as_deref(),
                 prompt,
                 config.timeout_seconds,
                 &prompt_dir,
                 &profile.alias,
-            ) {
+            );
+            if cancelled(state, generation) {
+                break 'models;
+            }
+            match result {
                 Ok((elapsed, tps)) => emit_prompt(
                     app,
                     profile_id,
@@ -252,7 +297,10 @@ fn run_inner(app: &AppHandle, state: &Arc<AppState>, config: BenchmarkConfig) {
         }
     }
 
-    let msg = if cancelled(state) {
+    if *state.benchmark_generation.lock().unwrap() != generation {
+        return;
+    }
+    let msg = if cancelled(state, generation) {
         "cancelled".to_string()
     } else {
         "finished".to_string()
@@ -291,10 +339,10 @@ fn run_finished(app: &AppHandle, state: &Arc<AppState>, previous: Option<String>
     process_manager::notify(app, state);
 }
 
-fn wait_healthy(app: &AppHandle, state: &Arc<AppState>, timeout_s: u64) -> bool {
+fn wait_healthy(app: &AppHandle, state: &Arc<AppState>, timeout_s: u64, generation: u64) -> bool {
     let deadline = Instant::now() + Duration::from_secs(timeout_s.max(1));
     while Instant::now() < deadline {
-        if cancelled(state) {
+        if cancelled(state, generation) {
             return false;
         }
         if process_manager::status_with_probe(app, state).healthy {
@@ -416,6 +464,51 @@ fn run_prompt(
     .map_err(|e| e.to_string())?;
 
     Ok((elapsed, tokens_per_second))
+}
+
+/// Run the blocking HTTP request on a disposable worker and let the benchmark
+/// coordinator observe cancellation while that request is in flight. This is
+/// important when Stop closes the server socket before ureq returns.
+fn run_prompt_cancellable(
+    state: &Arc<AppState>,
+    generation: u64,
+    origin: &str,
+    api_key: Option<&str>,
+    prompt: &BenchmarkPrompt,
+    timeout_s: u64,
+    prompt_dir: &Path,
+    alias: &str,
+) -> Result<(f64, Option<f64>), String> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let origin = origin.to_string();
+    let api_key = api_key.map(str::to_string);
+    let prompt = prompt.clone();
+    let prompt_dir = prompt_dir.to_path_buf();
+    let alias = alias.to_string();
+    std::thread::spawn(move || {
+        let result = run_prompt(
+            &origin,
+            api_key.as_deref(),
+            &prompt,
+            timeout_s,
+            &prompt_dir,
+            &alias,
+        );
+        let _ = sender.send(result);
+    });
+
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(200)) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) if cancelled(state, generation) => {
+                return Err("Benchmark cancelled.".into());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Benchmark request worker stopped unexpectedly.".into());
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
