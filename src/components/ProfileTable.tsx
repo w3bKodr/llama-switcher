@@ -1,6 +1,16 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import type { Profile, Status } from "../types";
+
+interface DragPreview {
+  id: string;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  offsetX: number;
+  offsetY: number;
+}
 
 export function ProfileTable({
   profiles,
@@ -24,21 +34,74 @@ export function ProfileTable({
   showToast: (m: string, e?: boolean) => void;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
-  const [draggedId, setDraggedId] = useState<string | null>(null);
-  const [dragTargetId, setDragTargetId] = useState<string | null>(null);
+  const [drag, setDrag] = useState<DragPreview | null>(null);
+  const gridRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    if (!draggedId) return;
-    const trackDrag = (event: PointerEvent) => {
-      const element = document.elementFromPoint(event.clientX, event.clientY) as HTMLElement | null;
-      const targetId = element?.closest<HTMLElement>("[data-profile-id]")?.dataset.profileId;
-      if (!targetId || targetId === draggedId || targetId === dragTargetId) return;
-      setDragTargetId(targetId);
+    if (!drag) return;
+    document.body.classList.add("profile-drag-active");
+
+    const animateReorder = (draggedId: string, targetId: string) => {
+      const previousTops = new Map<string, number>();
+      gridRef.current?.querySelectorAll<HTMLElement>(".profile-card:not(.dragging)").forEach((card) => {
+        const id = card.dataset.profileId;
+        if (id) previousTops.set(id, card.getBoundingClientRect().top);
+      });
+
       onReorder?.(draggedId, targetId);
+      window.requestAnimationFrame(() => {
+        gridRef.current?.querySelectorAll<HTMLElement>(".profile-card:not(.dragging)").forEach((card) => {
+          const id = card.dataset.profileId;
+          const previousTop = id ? previousTops.get(id) : undefined;
+          if (previousTop === undefined) return;
+          const delta = previousTop - card.getBoundingClientRect().top;
+          if (Math.abs(delta) < 1) return;
+          card.animate(
+            [{ transform: `translateY(${delta}px)` }, { transform: "translateY(0)" }],
+            { duration: 190, easing: "cubic-bezier(0.2, 0.8, 0.2, 1)" },
+          );
+        });
+      });
+    };
+
+    const trackDrag = (event: PointerEvent) => {
+      setDrag((current) => current ? {
+        ...current,
+        left: event.clientX - current.offsetX,
+        top: event.clientY - current.offsetY,
+      } : current);
+
+      const cards = Array.from(
+        gridRef.current?.querySelectorAll<HTMLElement>(".profile-card:not(.dragging)") ?? [],
+      );
+      const target = cards.reduce<{ card: HTMLElement; distance: number } | null>((closest, card) => {
+        const rect = card.getBoundingClientRect();
+        const distance = Math.abs(event.clientY - (rect.top + rect.height / 2));
+        return !closest || distance < closest.distance ? { card, distance } : closest;
+      }, null)?.card;
+      const targetId = target?.dataset.profileId;
+      if (!target || !targetId) return;
+
+      const draggedIndex = profiles.findIndex((profile) => profile.id === drag.id);
+      const targetIndex = profiles.findIndex((profile) => profile.id === targetId);
+      const targetRect = target.getBoundingClientRect();
+      const crossedTarget = targetIndex < draggedIndex
+        ? event.clientY < targetRect.top + targetRect.height / 2
+        : targetIndex > draggedIndex && event.clientY > targetRect.top + targetRect.height / 2;
+      if (!crossedTarget) return;
+
+      animateReorder(drag.id, targetId);
+
+      const scroller = gridRef.current?.closest<HTMLElement>(".content");
+      if (scroller) {
+        const bounds = scroller.getBoundingClientRect();
+        if (event.clientY < bounds.top + 52) scroller.scrollBy({ top: -18 });
+        else if (event.clientY > bounds.bottom - 52) scroller.scrollBy({ top: 18 });
+      }
     };
     const finishDrag = () => {
-      setDraggedId(null);
-      setDragTargetId(null);
+      setDrag(null);
+      document.body.classList.remove("profile-drag-active");
     };
     window.addEventListener("pointermove", trackDrag);
     window.addEventListener("pointerup", finishDrag);
@@ -49,8 +112,9 @@ export function ProfileTable({
       window.removeEventListener("pointerup", finishDrag);
       window.removeEventListener("pointercancel", finishDrag);
       window.removeEventListener("blur", finishDrag);
+      document.body.classList.remove("profile-drag-active");
     };
-  }, [dragTargetId, draggedId, onReorder]);
+  }, [drag?.id, onReorder, profiles]);
 
   async function run(profile: Profile) {
     setBusy(profile.id);
@@ -70,17 +134,30 @@ export function ProfileTable({
   }
 
   return (
-    <div className={`profile-grid ${reorderable ? "favorite-grid" : ""}`}>
+    <div ref={gridRef} className={`profile-grid ${reorderable ? "favorite-grid" : ""}`}>
       {profiles.map((profile, index) => {
         const isCurrent = status?.running && status.currentProfileId === profile.id;
         const isFavorite = favoriteIds.includes(profile.id);
+        const isDragged = drag?.id === profile.id;
         const filename = profile.scriptPath.split(/[\\/]/).pop() ?? profile.scriptPath;
         return (
-          <article
-            className={`profile-card ${isCurrent ? "current" : ""} ${draggedId === profile.id ? "dragging" : ""} ${dragTargetId === profile.id ? "drag-target" : ""}`}
-            key={profile.id}
-            data-profile-id={profile.id}
-          >
+          <Fragment key={profile.id}>
+            {isDragged && drag && (
+              <div className="profile-drop-slot" style={{ height: drag.height }} aria-hidden="true">
+                <span>Drop at position {index + 1}</span>
+              </div>
+            )}
+            <article
+              className={`profile-card ${isCurrent ? "current" : ""} ${isDragged ? "dragging" : ""}`}
+              data-profile-id={profile.id}
+              style={isDragged && drag ? {
+                left: drag.left,
+                top: drag.top,
+                width: drag.width,
+                height: drag.height,
+              } : undefined}
+            >
+            {isDragged && <span className="drag-position-badge">Position {index + 1}</span>}
             <div className="profile-card-topline">
               {reorderable && (
                 <button
@@ -91,8 +168,19 @@ export function ProfileTable({
                   onPointerDown={(event) => {
                     if (event.button !== 0) return;
                     event.preventDefault();
-                    setDraggedId(profile.id);
-                    setDragTargetId(null);
+                    const card = event.currentTarget.closest<HTMLElement>(".profile-card");
+                    if (!card) return;
+                    const bounds = card.getBoundingClientRect();
+                    document.body.classList.add("profile-drag-active");
+                    setDrag({
+                      id: profile.id,
+                      left: bounds.left,
+                      top: bounds.top,
+                      width: bounds.width,
+                      height: bounds.height,
+                      offsetX: event.clientX - bounds.left,
+                      offsetY: event.clientY - bounds.top,
+                    });
                   }}
                   onKeyDown={(event) => {
                     if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
@@ -142,7 +230,8 @@ export function ProfileTable({
                 {busy === profile.id ? "Starting…" : isCurrent ? "Restart" : "Start"}
               </button>
             </div>
-          </article>
+            </article>
+          </Fragment>
         );
       })}
     </div>
