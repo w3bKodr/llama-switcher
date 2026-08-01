@@ -5,6 +5,7 @@ use crate::settings::Settings;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::process::Child;
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
 /// The currently running managed llama.cpp server (the shell we launched plus
@@ -21,6 +22,9 @@ pub struct RunningProcess {
 }
 
 pub struct AppState {
+    /// Set before asynchronous shutdown begins. Prevents duplicate quit work
+    /// and stops UI/tray refreshes while the runtime is being torn down.
+    pub shutting_down: AtomicBool,
     pub settings: Mutex<Settings>,
     pub scan: Mutex<ScanResult>,
     pub running: Mutex<Option<RunningProcess>>,
@@ -80,6 +84,7 @@ pub enum UsageState {
 impl AppState {
     pub fn new(settings: Settings, scan: ScanResult, settings_path: PathBuf, logs_dir: PathBuf) -> Self {
         AppState {
+            shutting_down: AtomicBool::new(false),
             settings: Mutex::new(settings),
             scan: Mutex::new(scan),
             running: Mutex::new(None),

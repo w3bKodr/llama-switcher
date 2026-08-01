@@ -6,6 +6,7 @@ dist-ssr
 
 # Rust / Tauri
 src-tauri/target
+.build-temp*/
 
 # Hermes skill
 hermes-skill/node_modules

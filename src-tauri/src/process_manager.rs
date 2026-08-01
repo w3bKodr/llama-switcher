@@ -12,7 +12,9 @@ use crate::settings::{DefaultProfileMode, Settings};
 use crate::state::{AppState, RunningProcess, Status, UsageState, VramProcess, VramStatus};
 use crate::tray;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::process::{Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,6 +28,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Emit the current status to the frontend and refresh the tray menu.
 pub fn notify(app: &AppHandle, state: &Arc<AppState>) {
+    if state.shutting_down.load(Ordering::Relaxed) {
+        return;
+    }
     let status = state.status();
     let _ = app.emit("status-changed", &status);
     tray::rebuild(app, state);
@@ -199,7 +204,7 @@ fn probe_vram(server_pid: Option<u32>) -> VramStatus {
             }
         }
     }
-    processes.sort_by(|a, b| b.used_mib.cmp(&a.used_mib));
+    processes = reconcile_vram_processes(processes, total_mib, server_pid);
     // Under Windows' WDDM driver mode, nvidia-smi often reports total VRAM but
     // omits every process. Windows' own GPU counters expose those allocations.
     let mut windows_processes = probe_windows_vram_processes();
@@ -334,8 +339,36 @@ fn query_windows_vram_processes() -> Vec<VramProcess> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    // The Windows counter provider can retain a large allocation after its
+    // owner exits. If Windows later reuses that PID, Get-Process gives the
+    // stale allocation the new process's name (the observed 20 GB Firefox
+    // bug). NVIDIA pmon is a live list, so require every displayed PID to be
+    // active there instead of trusting the stale counter instance name.
+    if let Some(active_pids) = query_active_gpu_pids() {
+        processes.retain(|process| active_pids.contains(&process.pid));
+    }
     processes.sort_by(|a, b| b.used_mib.cmp(&a.used_mib));
     processes
+}
+
+fn query_active_gpu_pids() -> Option<HashSet<u32>> {
+    let output = Command::new("nvidia-smi")
+        .args(["pmon", "-c", "1", "-s", "m"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_active_gpu_pids(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn parse_active_gpu_pids(output: &str) -> HashSet<u32> {
+    output
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter_map(|line| line.split_whitespace().nth(1)?.parse::<u32>().ok())
+        .collect()
 }
 
 /// Average generation tokens/sec for the current model since it started.
@@ -966,6 +999,9 @@ pub fn activate_profile(
     state: &Arc<AppState>,
     profile_id: &str,
 ) -> Result<Status, String> {
+    if state.shutting_down.load(Ordering::Relaxed) {
+        return Err("Application is shutting down.".into());
+    }
     let settings = state.settings_snapshot();
     let profile = state
         .find_profile(profile_id)
@@ -1188,16 +1224,102 @@ fn spawn_health_poller(app: AppHandle, state: Arc<AppState>, profile_id: String,
 // ---------------------------------------------------------------------------
 
 pub fn restart_server(app: &AppHandle, state: &Arc<AppState>) -> Result<Status, String> {
-    let current = state
-        .running
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|rp| rp.profile.id.clone());
-    match current {
-        Some(id) => activate_profile(app, state, &id),
-        None => Err("No server is currently running to restart.".into()),
+    let (profile_id, old_shell_pid, old_log_path) = {
+        let running = state.running.lock().unwrap();
+        let current = running
+            .as_ref()
+            .ok_or_else(|| "No server is currently running to restart.".to_string())?;
+        (
+            current.profile.id.clone(),
+            current.pid,
+            current.log_path.clone(),
+        )
+    };
+    logging::append_line(&old_log_path, "Restart requested.");
+    let old_listener_pid = pid_on_port(state.settings_snapshot().server_port);
+
+    let launched = activate_profile(app, state, &profile_id)?;
+    let new_shell_pid = launched
+        .pid
+        .ok_or_else(|| "Restart did not create a new server process.".to_string())?;
+    if new_shell_pid == old_shell_pid {
+        return Err(format!(
+            "Restart reused the old shell PID {} instead of launching a replacement.",
+            old_shell_pid
+        ));
     }
+
+    wait_for_restart_ready(
+        app,
+        state,
+        &profile_id,
+        new_shell_pid,
+        old_listener_pid,
+    )
+}
+
+fn wait_for_restart_ready(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    profile_id: &str,
+    new_shell_pid: u32,
+    old_listener_pid: Option<u32>,
+) -> Result<Status, String> {
+    let settings = state.settings_snapshot();
+    let deadline = Instant::now()
+        + Duration::from_secs(settings.health_check_timeout_seconds.max(1));
+
+    loop {
+        {
+            let running = state.running.lock().unwrap();
+            let still_current = running.as_ref().is_some_and(|process| {
+                process.profile.id == profile_id && process.pid == new_shell_pid
+            });
+            if !still_current {
+                return Err("The replacement server exited or was superseded during restart.".into());
+            }
+        }
+
+        let listener_pid = pid_on_port(settings.server_port);
+        let listener_replaced = restart_has_replacement_listener(old_listener_pid, listener_pid);
+        let health = listener_replaced.then(|| probe_health(&settings.health_url));
+        if health.as_ref().is_some_and(|probe| probe.healthy) {
+            {
+                let mut running = state.running.lock().unwrap();
+                if let Some(process) = running.as_mut() {
+                    if process.profile.id == profile_id && process.pid == new_shell_pid {
+                        process.healthy = true;
+                        logging::append_line(
+                            &process.log_path,
+                            &format!(
+                                "Restart verified: new shell PID {}, listener PID {}, health endpoint ready.",
+                                new_shell_pid,
+                                listener_pid.unwrap_or_default()
+                            ),
+                        );
+                    }
+                }
+            }
+            notify(app, state);
+            let mut status = state.status();
+            status.server_reachable = true;
+            status.healthy = true;
+            return Ok(status);
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Replacement server launched as PID {} but did not become healthy within {} seconds.",
+                new_shell_pid, settings.health_check_timeout_seconds
+            ));
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn restart_has_replacement_listener(old_listener: Option<u32>, current_listener: Option<u32>) -> bool {
+    current_listener.is_some()
+        && (old_listener.is_none() || current_listener != old_listener)
 }
 
 // ---------------------------------------------------------------------------
@@ -1329,6 +1451,25 @@ mod tests {
 
         let reconciled = reconcile_vram_processes(processes, 24_576, Some(101));
         assert_eq!(reconciled.len(), 2);
+    }
+
+    #[test]
+    fn parses_only_live_pids_from_nvidia_pmon() {
+        let output = "# gpu pid type fb ccpm command\n\
+                         0  42928 C 20480 0 llama-server.exe\n\
+                         0  12832 G 112 0 explorer.exe\n";
+        let active = parse_active_gpu_pids(output);
+        assert!(active.contains(&42_928));
+        assert!(active.contains(&12_832));
+        assert!(!active.contains(&22_184));
+    }
+
+    #[test]
+    fn restart_requires_a_new_listener_process() {
+        assert!(!restart_has_replacement_listener(Some(9_148), None));
+        assert!(!restart_has_replacement_listener(Some(9_148), Some(9_148)));
+        assert!(restart_has_replacement_listener(Some(9_148), Some(35_456)));
+        assert!(restart_has_replacement_listener(None, Some(35_456)));
     }
 
     #[test]

@@ -13,6 +13,7 @@ mod state;
 mod tray;
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use script_scanner::{Profile, ScanResult};
@@ -114,8 +115,29 @@ pub fn open_folder(path: &str) {
 /// Stop any running server then exit the whole application.
 pub fn quit_app(app: &AppHandle) {
     let state = get_state(app);
-    let _ = process_manager::stop_server(app, &state);
-    app.exit(0);
+    if state.shutting_down.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    // Never wait for process-tree cleanup on Tauri's menu/event thread. That
+    // made Windows mark the app as hung and could deadlock with status/tray
+    // callbacks. Hide immediately, then stop the server and exit off-thread.
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+    benchmark::cancel(app, &state);
+    let exit_fallback = app.clone();
+    std::thread::spawn(move || {
+        // A user-configured stop timeout or a stuck operation lock must never
+        // keep the application resident indefinitely after Quit.
+        std::thread::sleep(Duration::from_secs(8));
+        exit_fallback.exit(0);
+    });
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let _ = process_manager::stop_server(&handle, &state);
+        handle.exit(0);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +197,34 @@ fn get_detected_profiles(state: State<'_, Arc<AppState>>) -> Vec<Profile> {
 #[tauri::command]
 fn get_scan_result(state: State<'_, Arc<AppState>>) -> ScanResult {
     state.scan.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn save_favorite_profiles(
+    state: State<'_, Arc<AppState>>,
+    profile_ids: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let detected: std::collections::HashSet<String> =
+        state.profiles().into_iter().map(|profile| profile.id).collect();
+    let favorites = normalize_favorite_profile_ids(profile_ids, &detected);
+
+    let mut settings = state.settings.lock().unwrap();
+    settings.favorite_profile_ids = favorites.clone();
+    settings.save(&state.settings_path)?;
+    Ok(favorites)
+}
+
+fn normalize_favorite_profile_ids(
+    profile_ids: Vec<String>,
+    detected: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut favorites = Vec::new();
+    for id in profile_ids {
+        if detected.contains(&id) && !favorites.contains(&id) {
+            favorites.push(id);
+        }
+    }
+    favorites
 }
 
 #[tauri::command]
@@ -484,7 +534,7 @@ pub fn run() {
                 let s = state.clone();
                 std::thread::spawn(move || {
                     let mut last_status: Option<Status> = None;
-                    loop {
+                    while !s.shutting_down.load(Ordering::Relaxed) {
                         let status = process_manager::status_with_probe(&h, &s);
                         process_manager::sweep_stale_servers(&h, &s, &status);
                         tray::refresh_visual(&h, &status);
@@ -502,9 +552,13 @@ pub fn run() {
                 if interval > 0 {
                     let h = handle.clone();
                     let s = state.clone();
-                    std::thread::spawn(move || loop {
-                        std::thread::sleep(Duration::from_secs(interval));
-                        rescan_and_store(&h, &s);
+                    std::thread::spawn(move || {
+                        while !s.shutting_down.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_secs(interval));
+                            if !s.shutting_down.load(Ordering::Relaxed) {
+                                rescan_and_store(&h, &s);
+                            }
+                        }
                     });
                 }
             }
@@ -523,8 +577,11 @@ pub fn run() {
         .on_window_event(|window, event| {
             // Closing the window hides it to tray instead of quitting.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+                let state = get_state(window.app_handle());
+                if !state.shutting_down.load(Ordering::Relaxed) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -535,6 +592,7 @@ pub fn run() {
             rescan_scripts,
             get_detected_profiles,
             get_scan_result,
+            save_favorite_profiles,
             start_profile,
             switch_profile,
             switch_profile_by_name,
@@ -562,4 +620,25 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_favorite_profile_ids;
+    use std::collections::HashSet;
+
+    #[test]
+    fn favorite_order_is_preserved_and_invalid_ids_are_removed() {
+        let detected = HashSet::from(["alpha".to_string(), "beta".to_string()]);
+        let saved = normalize_favorite_profile_ids(
+            vec![
+                "beta".into(),
+                "missing".into(),
+                "alpha".into(),
+                "beta".into(),
+            ],
+            &detected,
+        );
+        assert_eq!(saved, vec!["beta", "alpha"]);
+    }
 }

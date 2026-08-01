@@ -42,6 +42,7 @@ export interface Settings {
   defaultProfileMode: DefaultProfileMode;
   defaultProfileId: string | null;
   lastUsedProfileId: string | null;
+  favoriteProfileIds: string[];
   stopTimeoutSeconds: number;
   healthCheckTimeoutSeconds: number;
   // Image names of the llama.cpp server binary used to enforce a single running

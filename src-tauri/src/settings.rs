@@ -31,6 +31,10 @@ pub struct Settings {
     pub default_profile_mode: DefaultProfileMode,
     pub default_profile_id: Option<String>,
     pub last_used_profile_id: Option<String>,
+    /// Starred profile ids in the exact order chosen on the Detected Scripts
+    /// page. Missing ids are harmless when scripts are renamed or removed.
+    #[serde(default)]
+    pub favorite_profile_ids: Vec<String>,
     pub stop_timeout_seconds: u64,
     pub health_check_timeout_seconds: u64,
     /// Image names of the llama.cpp server binary. To guarantee a single running
@@ -62,6 +66,7 @@ impl Default for Settings {
             default_profile_mode: DefaultProfileMode::None,
             default_profile_id: None,
             last_used_profile_id: None,
+            favorite_profile_ids: Vec::new(),
             stop_timeout_seconds: 15,
             health_check_timeout_seconds: 60,
             server_process_names: default_server_process_names(),

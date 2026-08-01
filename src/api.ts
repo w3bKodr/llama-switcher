@@ -20,6 +20,8 @@ export const api = {
   rescanScripts: () => invoke<ScanResult>("rescan_scripts"),
   getDetectedProfiles: () => invoke<Profile[]>("get_detected_profiles"),
   getScanResult: () => invoke<ScanResult>("get_scan_result"),
+  saveFavoriteProfiles: (profileIds: string[]) =>
+    invoke<string[]>("save_favorite_profiles", { profileIds }),
 
   startProfile: (profileId: string) =>
     invoke<Status>("start_profile", { profileId }),

@@ -12,10 +12,10 @@ export function StatusPage({
   onAction: () => void;
   showToast: (m: string, e?: boolean) => void;
 }) {
-  const [busy, setBusy] = useState(false);
+  const [busyAction, setBusyAction] = useState<string | null>(null);
 
   async function run(label: string, fn: () => Promise<unknown>) {
-    setBusy(true);
+    setBusyAction(label);
     try {
       await fn();
       showToast(`${label} succeeded.`);
@@ -23,7 +23,7 @@ export function StatusPage({
     } catch (e) {
       showToast(`${label} failed: ${String(e)}`, true);
     } finally {
-      setBusy(false);
+      setBusyAction(null);
     }
   }
 
@@ -38,25 +38,25 @@ export function StatusPage({
       <div className="btn-row status-actions">
         <button
           className="btn danger"
-          disabled={busy}
+          disabled={busyAction !== null}
           onClick={() => run("Stop", api.stopServer)}
         >
-          Stop
+          {busyAction === "Stop" ? "Stopping…" : "Stop"}
         </button>
         <button
           className="btn"
-          disabled={busy || !running}
+          disabled={busyAction !== null || !running}
           onClick={() => run("Restart", api.restartServer)}
         >
-          Restart
+          {busyAction === "Restart" ? "Restarting…" : "Restart"}
         </button>
-        <button className="btn" disabled={busy} onClick={() => run("Rescan", api.rescanScripts)}>
-          Rescan
+        <button className="btn" disabled={busyAction !== null} onClick={() => run("Rescan", api.rescanScripts)}>
+          {busyAction === "Rescan" ? "Rescanning…" : "Rescan"}
         </button>
-        <button className="btn" disabled={busy} onClick={() => run("Open scripts folder", api.openScriptsFolder)}>
+        <button className="btn" disabled={busyAction !== null} onClick={() => run("Open scripts folder", api.openScriptsFolder)}>
           Open scripts folder
         </button>
-        <button className="btn" disabled={busy} onClick={() => run("Open logs folder", api.openLogsFolder)}>
+        <button className="btn" disabled={busyAction !== null} onClick={() => run("Open logs folder", api.openLogsFolder)}>
           Open logs folder
         </button>
       </div>
