@@ -6,6 +6,8 @@ dist-ssr
 
 # Rust / Tauri
 src-tauri/target
+widget/src-tauri/target
+widget/src-tauri/gen
 .build-temp*/
 
 # Hermes skill

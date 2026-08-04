@@ -11,6 +11,8 @@ logic) and a small **React + TypeScript + Vite** dashboard.
   tree), waits for it to exit, frees the port, then launches the new script.
 - A local HTTP API (127.0.0.1 only, bearer-token auth) lets **Hermes Agent**
   control the app. Hermes never runs scripts directly.
+- An optional transparent desktop widget shows the loaded model, feature, VRAM,
+  generation speed, and live usage without opening the full dashboard.
 
 > **Hermes is not a llama.cpp model/profile.** It is a separate agent that
 > controls Llama Switcher through the local API or the `hermes-skill/` adapter.
@@ -87,8 +89,31 @@ src-tauri/src/
   state.rs               Shared app state
   lib.rs                 Tauri commands + setup
 hermes-skill/            TypeScript adapter for Hermes Agent
+widget/                  Standalone transparent Windows telemetry widget
 HERMES_AGENT_TOOLING.md  Full local API + agent tooling reference
 ```
+
+## Desktop widget
+
+The standalone widget lives in [`widget/`](widget/). It displays the current
+model and feature, total and model VRAM usage, average tokens per second, and
+whether the server is ready or generating. Short local-API stalls retain the
+last valid telemetry and show a reconnecting state instead of incorrectly
+reporting that Llama Switcher has stopped.
+
+Widget settings include transparency, glass blur, always-on-top behavior,
+Windows startup registration, and the telemetry refresh interval. To develop or
+build it separately:
+
+```bash
+cd widget
+npm install
+npm run tauri dev
+npm run tauri build
+```
+
+The widget installer is produced under
+`widget/src-tauri/target/release/bundle/nsis/`.
 
 ## Settings
 
