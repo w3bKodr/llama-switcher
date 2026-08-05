@@ -18,6 +18,9 @@ use std::time::Duration;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use script_scanner::{Profile, ScanResult};
 use settings::{DefaultProfileMode, Settings};
 use state::{AppState, Status};
@@ -500,6 +503,16 @@ const WIDGET_EXE_NAME: &str = "llama-switcher-widget.exe";
 const WIDGET_INSTALLER_NAME: &str = "Llama-Switcher-Widget-setup.exe";
 const WINDOWS_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+fn hidden_windows_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
 fn parse_registry_string(output: &str) -> Option<String> {
     output
         .lines()
@@ -509,7 +522,7 @@ fn parse_registry_string(output: &str) -> Option<String> {
 
 #[cfg(windows)]
 fn query_registry_string(key: &str, value: Option<&str>) -> Option<String> {
-    let mut command = Command::new("reg.exe");
+    let mut command = hidden_windows_command("reg.exe");
     command.args(["query", key]);
     match value {
         Some(name) => { command.args(["/v", name]); }
@@ -586,14 +599,14 @@ fn resolve_widget_installer(app: &AppHandle) -> Option<PathBuf> {
 fn configure_widget_autostart(executable: &Path, enabled: bool) -> Result<(), String> {
     let status = if enabled {
         let quoted_executable = format!("\"{}\"", executable.display());
-        Command::new("reg.exe")
+        hidden_windows_command("reg.exe")
             .args([
                 "add", WINDOWS_RUN_KEY, "/v", WIDGET_PRODUCT_NAME,
                 "/t", "REG_SZ", "/d", &quoted_executable, "/f",
             ])
             .status()
     } else {
-        Command::new("reg.exe")
+        hidden_windows_command("reg.exe")
             .args(["delete", WINDOWS_RUN_KEY, "/v", WIDGET_PRODUCT_NAME, "/f"])
             .status()
     }.map_err(|error| format!("Could not update Windows startup: {error}"))?;
@@ -612,7 +625,11 @@ fn configure_widget_autostart(_executable: &Path, _enabled: bool) -> Result<(), 
 }
 
 #[tauri::command]
-fn get_widget_install_status() -> WidgetInstallStatus { widget_status() }
+async fn get_widget_install_status() -> Result<WidgetInstallStatus, String> {
+    tauri::async_runtime::spawn_blocking(widget_status)
+        .await
+        .map_err(|error| format!("Widget status worker stopped unexpectedly: {error}"))
+}
 
 #[tauri::command]
 async fn install_widget(app: AppHandle, start_with_windows: bool) -> Result<WidgetInstallStatus, String> {

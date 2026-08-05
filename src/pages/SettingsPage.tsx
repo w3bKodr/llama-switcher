@@ -19,14 +19,24 @@ export function SettingsPage({
   useEffect(() => {
     (async () => {
       try {
-        const [loadedSettings, loadedProfiles, loadedWidgetStatus] = await Promise.all([
-          api.getSettings(),
-          api.getDetectedProfiles(),
-          api.getWidgetInstallStatus(),
-        ]);
+        const loadedSettings = await api.getSettings();
         setSettings(loadedSettings);
-        setProfiles(loadedProfiles);
-        setWidgetStatus(loadedWidgetStatus);
+
+        // Profile choices enhance one field but should never hold up the
+        // entire settings screen.
+        void api.getDetectedProfiles()
+          .then(setProfiles)
+          .catch((error) => console.warn("Could not load profile choices", error));
+
+        // Widget detection can touch the Windows registry. It is deliberately
+        // non-blocking so the settings form is usable as soon as its own data
+        // arrives.
+        void api.getWidgetInstallStatus()
+          .then(setWidgetStatus)
+          .catch((error) => {
+            console.warn("Could not determine widget installation status", error);
+            setWidgetStatus({ installed: false, executablePath: null, startWithWindows: false });
+          });
       } catch (e) {
         showToast(`Failed to load settings: ${String(e)}`, true);
       }
