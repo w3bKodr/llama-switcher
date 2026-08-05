@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { DefaultProfileMode, Profile, Settings } from "../types";
+import type { DefaultProfileMode, Profile, Settings, WidgetInstallStatus } from "../types";
 
 const ALL_EXTENSIONS = [".cmd", ".bat", ".ps1"];
 
@@ -12,12 +12,21 @@ export function SettingsPage({
   const [settings, setSettings] = useState<Settings | null>(null);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [busy, setBusy] = useState(false);
+  const [widgetStatus, setWidgetStatus] = useState<WidgetInstallStatus | null>(null);
+  const [widgetInstalling, setWidgetInstalling] = useState(false);
+  const [widgetPromptOpen, setWidgetPromptOpen] = useState(false);
 
   useEffect(() => {
     (async () => {
       try {
-        setSettings(await api.getSettings());
-        setProfiles(await api.getDetectedProfiles());
+        const [loadedSettings, loadedProfiles, loadedWidgetStatus] = await Promise.all([
+          api.getSettings(),
+          api.getDetectedProfiles(),
+          api.getWidgetInstallStatus(),
+        ]);
+        setSettings(loadedSettings);
+        setProfiles(loadedProfiles);
+        setWidgetStatus(loadedWidgetStatus);
       } catch (e) {
         showToast(`Failed to load settings: ${String(e)}`, true);
       }
@@ -86,10 +95,62 @@ export function SettingsPage({
     }
   }
 
+  async function installWidget(startWithWindows: boolean) {
+    setWidgetPromptOpen(false);
+    setWidgetInstalling(true);
+    try {
+      const installed = await api.installWidget(startWithWindows);
+      setWidgetStatus(installed);
+      showToast(
+        startWithWindows
+          ? "Widget installed and set to start with Windows."
+          : "Widget installed. Windows startup is disabled."
+      );
+    } catch (e) {
+      showToast(`Widget installation failed: ${String(e)}`, true);
+    } finally {
+      setWidgetInstalling(false);
+    }
+  }
+
   return (
     <div>
       <h1>Settings</h1>
       <p className="subtitle">Stored as JSON in the app data directory.</p>
+
+      <div className="card widget-install-card">
+        <div className="widget-install-copy">
+          <div className="widget-install-icon" aria-hidden="true">◫</div>
+          <div>
+            <div className="widget-install-heading">
+              <h2>Desktop widget</h2>
+              <span className={`badge ${widgetStatus?.installed ? "green" : "yellow"}`}>
+                {widgetStatus?.installed ? "Installed" : widgetStatus ? "Not installed" : "Checking…"}
+              </span>
+            </div>
+            <p>
+              Keep the loaded model, feature, VRAM, tokens per second, and live
+              usage visible in a compact desktop monitor.
+            </p>
+            {widgetStatus?.installed && (
+              <span className="hint">
+                {widgetStatus.startWithWindows ? "Starts with Windows" : "Windows startup is off"}
+              </span>
+            )}
+          </div>
+        </div>
+        <button
+          className="btn primary widget-install-button"
+          disabled={!widgetStatus || widgetInstalling}
+          onClick={() => setWidgetPromptOpen(true)}
+        >
+          {widgetInstalling
+            ? "Installing…"
+            : widgetStatus?.installed
+              ? "Reinstall / update widget"
+              : "Install widget"}
+        </button>
+      </div>
 
       <div className="card">
         <h2 style={{ marginTop: 0 }}>Scripts</h2>
@@ -318,6 +379,37 @@ export function SettingsPage({
           {busy ? "Saving…" : "Save settings"}
         </button>
       </div>
+
+      {widgetPromptOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setWidgetPromptOpen(false)}>
+          <section
+            className="widget-install-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="widget-install-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="widget-install-modal-icon" aria-hidden="true">◫</div>
+            <span className="status-kicker">Desktop widget</span>
+            <h2 id="widget-install-title">Start the widget with Windows?</h2>
+            <p>
+              Choose whether the widget should launch automatically when you
+              sign in. You can change this later from the widget’s own settings.
+            </p>
+            <div className="widget-install-choices">
+              <button className="btn primary" onClick={() => void installWidget(true)}>
+                Install &amp; start with Windows
+              </button>
+              <button className="btn" onClick={() => void installWidget(false)}>
+                Install without startup
+              </button>
+              <button className="btn ghost" onClick={() => setWidgetPromptOpen(false)}>
+                Cancel
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

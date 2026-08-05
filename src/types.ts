@@ -114,6 +114,12 @@ export interface AgentApiInfo {
   token: string;
 }
 
+export interface WidgetInstallStatus {
+  installed: boolean;
+  executablePath: string | null;
+  startWithWindows: boolean;
+}
+
 export interface LogEntry {
   filename: string;
   path: string;

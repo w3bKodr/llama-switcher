@@ -9,6 +9,7 @@ import type {
   ScanResult,
   Settings,
   Status,
+  WidgetInstallStatus,
 } from "./types";
 
 export const api = {
@@ -50,6 +51,11 @@ export const api = {
   detectHermesSkillDirs: () => invoke<string[]>("detect_hermes_skill_dirs"),
   installHermesSkill: (targetDir: string) =>
     invoke<string>("install_hermes_skill", { targetDir }),
+
+  getWidgetInstallStatus: () =>
+    invoke<WidgetInstallStatus>("get_widget_install_status"),
+  installWidget: (startWithWindows: boolean) =>
+    invoke<WidgetInstallStatus>("install_widget", { startWithWindows }),
 
   getBenchmarkConfig: () => invoke<BenchmarkConfig>("get_benchmark_config"),
   saveBenchmarkConfig: (config: BenchmarkConfig) =>

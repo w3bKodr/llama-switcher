@@ -30,7 +30,7 @@ export default defineConfig({
   // Produce a small, modern bundle for the system WebView.
   build: {
     target: "esnext",
-    minify: "esbuild",
+    minify: "oxc",
     sourcemap: false,
   },
 });

@@ -105,6 +105,10 @@ Widget settings include transparency, glass blur, always-on-top behavior,
 Windows startup registration, and the telemetry refresh interval. To develop or
 build it separately:
 
+Packaged Llama Switcher builds include the widget installer. Open **Settings →
+Desktop widget** and click **Install widget**; the app asks whether the widget
+should start with Windows before launching the installer.
+
 ```bash
 cd widget
 npm install

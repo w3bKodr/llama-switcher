@@ -15,6 +15,8 @@ mod tray;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use script_scanner::{Profile, ScanResult};
 use settings::{DefaultProfileMode, Settings};
@@ -485,6 +487,153 @@ async fn browse_folder(app: AppHandle) -> Result<Option<String>, String> {
     Ok(folder.map(|f| f.to_string()))
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WidgetInstallStatus {
+    installed: bool,
+    executable_path: Option<String>,
+    start_with_windows: bool,
+}
+
+const WIDGET_PRODUCT_NAME: &str = "Llama Switcher Widget";
+const WIDGET_EXE_NAME: &str = "llama-switcher-widget.exe";
+const WIDGET_INSTALLER_NAME: &str = "Llama-Switcher-Widget-setup.exe";
+const WINDOWS_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+
+fn parse_registry_string(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find_map(|line| line.split_once("REG_SZ").map(|(_, value)| value.trim().to_string()))
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(windows)]
+fn query_registry_string(key: &str, value: Option<&str>) -> Option<String> {
+    let mut command = Command::new("reg.exe");
+    command.args(["query", key]);
+    match value {
+        Some(name) => { command.args(["/v", name]); }
+        None => { command.arg("/ve"); }
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() { return None; }
+    parse_registry_string(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(windows)]
+fn widget_executable_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(directory) = query_registry_string(
+        r"HKCU\Software\llamaswitcher\Llama Switcher Widget",
+        None,
+    ) {
+        candidates.push(PathBuf::from(directory).join(WIDGET_EXE_NAME));
+    }
+    if let Some(directory) = query_registry_string(
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Llama Switcher Widget",
+        Some("InstallLocation"),
+    ) {
+        candidates.push(PathBuf::from(directory.trim_matches('"')).join(WIDGET_EXE_NAME));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        candidates.push(local.join(WIDGET_PRODUCT_NAME).join(WIDGET_EXE_NAME));
+        candidates.push(local.join("Programs").join(WIDGET_PRODUCT_NAME).join(WIDGET_EXE_NAME));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+#[cfg(not(windows))]
+fn widget_executable_path() -> Option<PathBuf> { None }
+
+fn widget_status() -> WidgetInstallStatus {
+    let executable = widget_executable_path();
+    let start_with_windows = {
+        #[cfg(windows)]
+        { query_registry_string(WINDOWS_RUN_KEY, Some(WIDGET_PRODUCT_NAME)).is_some() }
+        #[cfg(not(windows))]
+        { false }
+    };
+    WidgetInstallStatus {
+        installed: executable.is_some(),
+        executable_path: executable.map(|path| path.to_string_lossy().to_string()),
+        start_with_windows,
+    }
+}
+
+fn resolve_widget_installer(app: &AppHandle) -> Option<PathBuf> {
+    if let Ok(resources) = app.path().resource_dir() {
+        let bundled = resources.join("widget").join(WIDGET_INSTALLER_NAME);
+        if bundled.is_file() { return Some(bundled); }
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let development = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("widget")
+            .join("src-tauri")
+            .join("target")
+            .join("release")
+            .join("bundle")
+            .join("nsis")
+            .join("Llama Switcher Widget_0.1.0_x64-setup.exe");
+        if development.is_file() { return Some(development); }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn configure_widget_autostart(executable: &Path, enabled: bool) -> Result<(), String> {
+    let status = if enabled {
+        let quoted_executable = format!("\"{}\"", executable.display());
+        Command::new("reg.exe")
+            .args([
+                "add", WINDOWS_RUN_KEY, "/v", WIDGET_PRODUCT_NAME,
+                "/t", "REG_SZ", "/d", &quoted_executable, "/f",
+            ])
+            .status()
+    } else {
+        Command::new("reg.exe")
+            .args(["delete", WINDOWS_RUN_KEY, "/v", WIDGET_PRODUCT_NAME, "/f"])
+            .status()
+    }.map_err(|error| format!("Could not update Windows startup: {error}"))?;
+
+    // `reg delete` returns 1 when the value did not exist, which already means
+    // the requested disabled state has been achieved.
+    if enabled && !status.success() {
+        return Err("Windows rejected the widget startup registration.".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn configure_widget_autostart(_executable: &Path, _enabled: bool) -> Result<(), String> {
+    Err("The desktop widget installer is currently available only on Windows.".into())
+}
+
+#[tauri::command]
+fn get_widget_install_status() -> WidgetInstallStatus { widget_status() }
+
+#[tauri::command]
+async fn install_widget(app: AppHandle, start_with_windows: bool) -> Result<WidgetInstallStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let installer = resolve_widget_installer(&app)
+            .ok_or_else(|| "The bundled widget installer could not be found. Reinstall or update Llama Switcher and try again.".to_string())?;
+        let exit = Command::new(&installer)
+            .status()
+            .map_err(|error| format!("Could not launch the widget installer: {error}"))?;
+        if !exit.success() {
+            return Err("The widget installation was cancelled or did not complete.".into());
+        }
+        let executable = widget_executable_path()
+            .ok_or_else(|| "The installer finished, but the widget executable was not found.".to_string())?;
+        configure_widget_autostart(&executable, start_with_windows)?;
+        Ok(widget_status())
+    })
+    .await
+    .map_err(|error| format!("Widget installer worker stopped unexpectedly: {error}"))?
+}
+
 // ---------------------------------------------------------------------------
 // App entry
 // ---------------------------------------------------------------------------
@@ -612,6 +761,8 @@ pub fn run() {
             browse_folder,
             detect_hermes_skill_dirs,
             install_hermes_skill,
+            get_widget_install_status,
+            install_widget,
             get_benchmark_config,
             save_benchmark_config,
             run_benchmark,
@@ -624,7 +775,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_favorite_profile_ids;
+    use super::{normalize_favorite_profile_ids, parse_registry_string};
     use std::collections::HashSet;
 
     #[test]
@@ -640,5 +791,17 @@ mod tests {
             &detected,
         );
         assert_eq!(saved, vec!["beta", "alpha"]);
+    }
+
+    #[test]
+    fn widget_install_path_is_parsed_from_reg_output() {
+        let output = r#"
+HKEY_CURRENT_USER\Software\llamaswitcher\Llama Switcher Widget
+    (Default)    REG_SZ    C:\Users\Example\AppData\Local\Llama Switcher Widget
+"#;
+        assert_eq!(
+            parse_registry_string(output).as_deref(),
+            Some(r"C:\Users\Example\AppData\Local\Llama Switcher Widget")
+        );
     }
 }
