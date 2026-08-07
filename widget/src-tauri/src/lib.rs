@@ -6,8 +6,21 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+fn hidden_windows_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,7 +84,7 @@ fn authorized_request(method: &str, endpoint: &str) -> Result<Value, String> {
 fn switcher_process_is_running() -> bool {
     #[cfg(windows)]
     {
-        let output = Command::new("tasklist")
+        let output = hidden_windows_command("tasklist")
             .args([
                 "/FI",
                 "IMAGENAME eq llama-switcher.exe",
@@ -114,13 +127,28 @@ fn launch_switcher_fallback() -> Result<(), String> {
     if let Some(path) = std::env::var_os("LLAMA_SWITCHER_PATH") {
         candidates.push(PathBuf::from(path));
     }
+    if let Ok(path) = switcher_settings_path() {
+        if let Ok(executable) = std::fs::read_to_string(
+            path.with_file_name("main-executable-path.txt"),
+        ) {
+            candidates.push(PathBuf::from(executable.trim()));
+        }
+    }
     if let Ok(current) = std::env::current_exe() {
         if let Some(parent) = current.parent() {
+            candidates.push(parent.join("llama-switcher.exe"));
             candidates.push(parent.join("Llama Switcher.exe"));
         }
     }
     if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        candidates.push(local.join("Llama Switcher").join("llama-switcher.exe"));
         candidates.push(local.join("Llama Switcher").join("Llama Switcher.exe"));
+        candidates.push(
+            local
+                .join("Programs")
+                .join("Llama Switcher")
+                .join("llama-switcher.exe"),
+        );
         candidates.push(
             local
                 .join("Programs")
@@ -196,13 +224,12 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                show_widget(tray.app_handle());
+            match event {
+                TrayIconEvent::Click { button: MouseButton::Left, .. }
+                | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => {
+                    show_widget(tray.app_handle());
+                }
+                _ => {}
             }
         });
     if let Some(icon) = app.default_window_icon() {

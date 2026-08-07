@@ -48,15 +48,19 @@ fn ensure_not_benchmarking(state: &Arc<AppState>) -> Result<(), String> {
 
 /// Show and focus the dashboard window, optionally navigating to a page.
 pub fn show_dashboard(app: &AppHandle, page: Option<&str>) {
-    if let Some(win) = app.get_webview_window("main") {
-        apply_window_icon(app);
-        let _ = win.show();
-        let _ = win.unminimize();
-        let _ = win.set_focus();
-        if let Some(p) = page {
-            let _ = app.emit("navigate", p);
+    let handle = app.clone();
+    let page = page.map(str::to_owned);
+    let _ = app.run_on_main_thread(move || {
+        if let Some(win) = handle.get_webview_window("main") {
+            apply_window_icon(&handle);
+            let _ = win.show();
+            let _ = win.unminimize();
+            let _ = win.set_focus();
+            if let Some(page) = page {
+                let _ = handle.emit("navigate", page);
+            }
         }
-    }
+    });
 }
 
 fn apply_window_icon(app: &AppHandle) {
@@ -664,11 +668,21 @@ pub fn run() {
             let handle = app.handle().clone();
 
             // Resolve and create the app data + logs directories.
-            let data_dir = handle
-                .path()
-                .app_data_dir()
-                .expect("failed to resolve app data dir");
+            let data_dir = std::env::var_os("LLAMA_SWITCHER_DATA_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    handle
+                        .path()
+                        .app_data_dir()
+                        .expect("failed to resolve app data dir")
+                });
             std::fs::create_dir_all(&data_dir).ok();
+            if let Ok(executable) = std::env::current_exe() {
+                let _ = std::fs::write(
+                    data_dir.join("main-executable-path.txt"),
+                    executable.to_string_lossy().as_bytes(),
+                );
+            }
             let settings_path = data_dir.join("settings.json");
             let logs_dir = data_dir.join("logs");
             std::fs::create_dir_all(&logs_dir).ok();

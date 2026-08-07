@@ -4,7 +4,7 @@ use crate::state::{AppState, Status, UsageState};
 use std::sync::Arc;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, Wry};
 
 pub const TRAY_ID: &str = "main-tray";
@@ -91,13 +91,12 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, event| handle_menu_event(app, event.id.as_ref()))
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                crate::show_dashboard(tray.app_handle(), None);
+            match event {
+                TrayIconEvent::Click { button: MouseButton::Left, .. }
+                | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => {
+                    crate::show_dashboard(tray.app_handle(), None);
+                }
+                _ => {}
             }
         })
         .build(app)?;
@@ -114,15 +113,25 @@ pub fn rebuild(app: &AppHandle, _state: &Arc<AppState>) {
 }
 
 pub fn refresh(app: &AppHandle, _state: &Arc<AppState>, status: &Status) {
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        if let Ok(menu) = build_menu(app, Some(status)) {
-            let _ = tray.set_menu(Some(menu));
+    let handle = app.clone();
+    let status = status.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(tray) = handle.tray_by_id(TRAY_ID) {
+            if let Ok(menu) = build_menu(&handle, Some(&status)) {
+                let _ = tray.set_menu(Some(menu));
+            }
+            refresh_visual_now(&handle, &status);
         }
-        refresh_visual(app, status);
-    }
+    });
 }
 
 pub fn refresh_visual(app: &AppHandle, status: &Status) {
+    let handle = app.clone();
+    let status = status.clone();
+    let _ = app.run_on_main_thread(move || refresh_visual_now(&handle, &status));
+}
+
+fn refresh_visual_now(app: &AppHandle, status: &Status) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_icon(Some(tray_icon_for_status(status)));
         let _ = tray.set_tooltip(Some(tray_tooltip(status)));
