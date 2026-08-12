@@ -121,7 +121,7 @@ The widget installer is produced under
 
 ## Settings
 
-Stored as JSON in the app data directory (`%APPDATA%\com.llamaswitcher.app\settings.json`):
+The **Start Llama Switcher with Windows** toggle uses the current user's Windows Run registration and is independent of script rescanning or profile auto-start. Other settings are stored as JSON in the app data directory (`%APPDATA%\com.llamaswitcher.app\settings.json`):
 
 ```json
 {

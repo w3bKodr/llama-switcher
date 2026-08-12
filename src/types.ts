@@ -94,6 +94,7 @@ export interface BenchmarkConfig {
   prompts: BenchmarkPrompt[];
   outputDir: string;
   timeoutSeconds: number;
+  modelStartTimeoutSeconds: number;
 }
 
 export interface BenchmarkProgress {

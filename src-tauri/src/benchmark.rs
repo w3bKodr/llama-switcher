@@ -30,10 +30,16 @@ pub struct BenchmarkConfig {
     pub output_dir: String,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
+    #[serde(default = "default_model_start_timeout")]
+    pub model_start_timeout_seconds: u64,
 }
 
 fn default_timeout() -> u64 {
     600
+}
+
+fn default_model_start_timeout() -> u64 {
+    300
 }
 
 #[derive(Serialize, Clone)]
@@ -101,6 +107,7 @@ pub fn default_config() -> BenchmarkConfig {
         ],
         output_dir: String::new(),
         timeout_seconds: 600,
+        model_start_timeout_seconds: default_model_start_timeout(),
     }
 }
 
@@ -134,17 +141,20 @@ fn invalidate_run(app: &AppHandle, state: &Arc<AppState>) {
     *state.benchmark_generation.lock().unwrap() += 1;
     drop(running);
     if was_running {
-        emit(app, Progress {
-            kind: "run".into(),
-            status: "cancelled".into(),
-            profile_id: None,
-            alias: None,
-            prompt_id: None,
-            output_path: None,
-            message: None,
-            duration_seconds: None,
-            tokens_per_second: None,
-        });
+        emit(
+            app,
+            Progress {
+                kind: "run".into(),
+                status: "cancelled".into(),
+                profile_id: None,
+                alias: None,
+                prompt_id: None,
+                output_path: None,
+                message: None,
+                duration_seconds: None,
+                tokens_per_second: None,
+            },
+        );
         process_manager::notify(app, state);
     }
 }
@@ -186,23 +196,31 @@ fn run_inner(app: &AppHandle, state: &Arc<AppState>, config: BenchmarkConfig, ge
     if cancelled(state, generation) {
         return;
     }
-    emit(app, Progress {
-        kind: "run".into(),
-        status: "running".into(),
-        profile_id: None,
-        alias: None,
-        prompt_id: None,
-        output_path: None,
-        message: None,
-        duration_seconds: None,
-        tokens_per_second: None,
-    });
+    emit(
+        app,
+        Progress {
+            kind: "run".into(),
+            status: "running".into(),
+            profile_id: None,
+            alias: None,
+            prompt_id: None,
+            output_path: None,
+            message: None,
+            duration_seconds: None,
+            tokens_per_second: None,
+        },
+    );
 
     let previous = state.status().current_profile_id.clone();
     let settings = state.settings_snapshot();
 
     if let Err(e) = std::fs::create_dir_all(&config.output_dir) {
-        run_finished(app, state, previous, format!("Cannot create output folder: {}", e));
+        run_finished(
+            app,
+            state,
+            previous,
+            format!("Cannot create output folder: {}", e),
+        );
         return;
     }
 
@@ -213,7 +231,13 @@ fn run_inner(app: &AppHandle, state: &Arc<AppState>, config: BenchmarkConfig, ge
         let profile = match state.find_profile(profile_id) {
             Some(p) => p,
             None => {
-                emit_model(app, profile_id, None, "error", Some("Unknown profile".into()));
+                emit_model(
+                    app,
+                    profile_id,
+                    None,
+                    "error",
+                    Some("Unknown profile".into()),
+                );
                 continue;
             }
         };
@@ -230,13 +254,16 @@ fn run_inner(app: &AppHandle, state: &Arc<AppState>, config: BenchmarkConfig, ge
                 emit_model(app, profile_id, Some(&profile.alias), "error", Some(e));
                 continue;
             }
-            if !wait_healthy(app, state, settings.health_check_timeout_seconds, generation) {
+            if !wait_healthy(app, state, config.model_start_timeout_seconds, generation) {
                 emit_model(
                     app,
                     profile_id,
                     Some(&profile.alias),
                     "error",
-                    Some("Server did not become healthy in time.".into()),
+                    Some(format!(
+                        "Server did not become healthy within {} seconds.",
+                        config.model_start_timeout_seconds.max(1)
+                    )),
                 );
                 continue;
             }
@@ -253,7 +280,14 @@ fn run_inner(app: &AppHandle, state: &Arc<AppState>, config: BenchmarkConfig, ge
             }
             let prompt_dir = model_dir.join(format!("prompt{}", i + 1));
             emit_prompt(
-                app, profile_id, &profile.alias, &prompt.id, "running", &prompt_dir, None, None,
+                app,
+                profile_id,
+                &profile.alias,
+                &prompt.id,
+                "running",
+                &prompt_dir,
+                None,
+                None,
                 None,
             );
 
@@ -325,17 +359,20 @@ fn run_finished(app: &AppHandle, state: &Arc<AppState>, previous: Option<String>
     }
     *state.benchmark_running.lock().unwrap() = false;
     *state.benchmark_cancel.lock().unwrap() = false;
-    emit(app, Progress {
-        kind: "run".into(),
-        status,
-        profile_id: None,
-        alias: None,
-        prompt_id: None,
-        output_path: None,
-        message: None,
-        duration_seconds: None,
-        tokens_per_second: None,
-    });
+    emit(
+        app,
+        Progress {
+            kind: "run".into(),
+            status,
+            profile_id: None,
+            alias: None,
+            prompt_id: None,
+            output_path: None,
+            message: None,
+            duration_seconds: None,
+            tokens_per_second: None,
+        },
+    );
     process_manager::notify(app, state);
 }
 
@@ -353,18 +390,27 @@ fn wait_healthy(app: &AppHandle, state: &Arc<AppState>, timeout_s: u64, generati
     false
 }
 
-fn emit_model(app: &AppHandle, profile_id: &str, alias: Option<&str>, status: &str, message: Option<String>) {
-    emit(app, Progress {
-        kind: "model".into(),
-        status: status.into(),
-        profile_id: Some(profile_id.into()),
-        alias: alias.map(|a| a.to_string()),
-        prompt_id: None,
-        output_path: None,
-        message,
-        duration_seconds: None,
-        tokens_per_second: None,
-    });
+fn emit_model(
+    app: &AppHandle,
+    profile_id: &str,
+    alias: Option<&str>,
+    status: &str,
+    message: Option<String>,
+) {
+    emit(
+        app,
+        Progress {
+            kind: "model".into(),
+            status: status.into(),
+            profile_id: Some(profile_id.into()),
+            alias: alias.map(|a| a.to_string()),
+            prompt_id: None,
+            output_path: None,
+            message,
+            duration_seconds: None,
+            tokens_per_second: None,
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -379,17 +425,20 @@ fn emit_prompt(
     duration_seconds: Option<f64>,
     tokens_per_second: Option<f64>,
 ) {
-    emit(app, Progress {
-        kind: "prompt".into(),
-        status: status.into(),
-        profile_id: Some(profile_id.into()),
-        alias: Some(alias.into()),
-        prompt_id: Some(prompt_id.into()),
-        output_path: Some(dir.to_string_lossy().to_string()),
-        message,
-        duration_seconds,
-        tokens_per_second,
-    });
+    emit(
+        app,
+        Progress {
+            kind: "prompt".into(),
+            status: status.into(),
+            profile_id: Some(profile_id.into()),
+            alias: Some(alias.into()),
+            prompt_id: Some(prompt_id.into()),
+            output_path: Some(dir.to_string_lossy().to_string()),
+            message,
+            duration_seconds,
+            tokens_per_second,
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -565,13 +614,21 @@ fn map_code_files(blocks: &[(String, String)]) -> Vec<(String, String)> {
     for (i, (lang, code)) in blocks.iter().enumerate() {
         let l = lang.to_lowercase();
         let head = code.trim_start().to_lowercase();
-        let base = if l == "html" || l == "htm" || head.starts_with("<!doctype html") || head.starts_with("<html") {
+        let base = if l == "html"
+            || l == "htm"
+            || head.starts_with("<!doctype html")
+            || head.starts_with("<html")
+        {
             "index.html".to_string()
         } else if l == "svg" || head.starts_with("<svg") {
             "image.svg".to_string()
         } else {
             let ext: String = l.chars().filter(|c| c.is_alphanumeric()).collect();
-            let ext = if ext.is_empty() { "txt".to_string() } else { ext };
+            let ext = if ext.is_empty() {
+                "txt".to_string()
+            } else {
+                ext
+            };
             format!("block{}.{}", i + 1, ext)
         };
         out.push((dedupe_name(base, &mut used), code.clone()));
@@ -622,5 +679,16 @@ mod tests {
     fn infers_svg_without_lang() {
         let files = map_code_files(&[(String::new(), "<svg>x</svg>".into())]);
         assert_eq!(files[0].0, "image.svg");
+    }
+
+    #[test]
+    fn legacy_config_gets_large_model_start_timeout() {
+        let config: BenchmarkConfig = serde_json::from_str(
+            r#"{"profileIds":[],"prompts":[],"outputDir":"","timeoutSeconds":600}"#,
+        )
+        .expect("legacy benchmark config should deserialize");
+
+        assert_eq!(config.model_start_timeout_seconds, 300);
+        assert_eq!(default_config().model_start_timeout_seconds, 300);
     }
 }

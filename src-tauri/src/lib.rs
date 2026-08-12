@@ -12,11 +12,11 @@ mod settings;
 mod state;
 mod tray;
 
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -213,8 +213,11 @@ fn save_favorite_profiles(
     state: State<'_, Arc<AppState>>,
     profile_ids: Vec<String>,
 ) -> Result<Vec<String>, String> {
-    let detected: std::collections::HashSet<String> =
-        state.profiles().into_iter().map(|profile| profile.id).collect();
+    let detected: std::collections::HashSet<String> = state
+        .profiles()
+        .into_iter()
+        .map(|profile| profile.id)
+        .collect();
     let favorites = normalize_favorite_profile_ids(profile_ids, &detected);
 
     let mut settings = state.settings.lock().unwrap();
@@ -300,10 +303,7 @@ async fn switch_profile_by_alias(
 }
 
 #[tauri::command]
-async fn stop_server(
-    app: AppHandle,
-    state: State<'_, Arc<AppState>>,
-) -> Result<Status, String> {
+async fn stop_server(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<Status, String> {
     // Stop is the emergency escape hatch: it always cancels an active
     // benchmark before shutting down the server.
     benchmark::cancel_and_stop(&app, state.inner());
@@ -314,10 +314,7 @@ async fn stop_server(
 }
 
 #[tauri::command]
-async fn restart_server(
-    app: AppHandle,
-    state: State<'_, Arc<AppState>>,
-) -> Result<Status, String> {
+async fn restart_server(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<Status, String> {
     ensure_not_benchmarking(state.inner())?;
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || process_manager::restart_server(&app, &st))
@@ -486,11 +483,10 @@ fn install_hermes_skill(
 #[tauri::command]
 async fn browse_folder(app: AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
-    let folder = tauri::async_runtime::spawn_blocking(move || {
-        app.dialog().file().blocking_pick_folder()
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+    let folder =
+        tauri::async_runtime::spawn_blocking(move || app.dialog().file().blocking_pick_folder())
+            .await
+            .map_err(|e| e.to_string())?;
     Ok(folder.map(|f| f.to_string()))
 }
 
@@ -503,9 +499,14 @@ struct WidgetInstallStatus {
 }
 
 const WIDGET_PRODUCT_NAME: &str = "Llama Switcher Widget";
+const MAIN_PRODUCT_NAME: &str = "Llama Switcher";
 const WIDGET_EXE_NAME: &str = "llama-switcher-widget.exe";
 const WIDGET_INSTALLER_NAME: &str = "Llama-Switcher-Widget-setup.exe";
 const WINDOWS_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const WINDOWS_STARTUP_APPROVED_RUN_KEY: &str =
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+const WINDOWS_STARTUP_APPROVED_FOLDER_KEY: &str =
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -520,8 +521,18 @@ fn hidden_windows_command(program: &str) -> Command {
 fn parse_registry_string(output: &str) -> Option<String> {
     output
         .lines()
-        .find_map(|line| line.split_once("REG_SZ").map(|(_, value)| value.trim().to_string()))
+        .find_map(|line| {
+            line.split_once("REG_SZ")
+                .map(|(_, value)| value.trim().to_string())
+        })
         .filter(|value| !value.is_empty())
+}
+fn parse_startup_approval_enabled(output: &str) -> Option<bool> {
+    let bytes = output
+        .lines()
+        .find_map(|line| line.split_once("REG_BINARY").map(|(_, value)| value.trim()))?;
+    let state = bytes.get(0..2)?;
+    Some(!state.eq_ignore_ascii_case("03"))
 }
 
 #[cfg(windows)]
@@ -529,21 +540,142 @@ fn query_registry_string(key: &str, value: Option<&str>) -> Option<String> {
     let mut command = hidden_windows_command("reg.exe");
     command.args(["query", key]);
     match value {
-        Some(name) => { command.args(["/v", name]); }
-        None => { command.arg("/ve"); }
+        Some(name) => {
+            command.args(["/v", name]);
+        }
+        None => {
+            command.arg("/ve");
+        }
     }
     let output = command.output().ok()?;
-    if !output.status.success() { return None; }
+    if !output.status.success() {
+        return None;
+    }
     parse_registry_string(&String::from_utf8_lossy(&output.stdout))
 }
 
 #[cfg(windows)]
+fn query_registry_value(key: &str, name: &str) -> Option<String> {
+    let output = hidden_windows_command("reg.exe")
+        .args(["query", key, "/v", name])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(windows)]
+fn startup_approval_enabled(key: &str, name: &str) -> bool {
+    query_registry_value(key, name)
+        .and_then(|output| parse_startup_approval_enabled(&output))
+        .unwrap_or(true)
+}
+
+#[cfg(windows)]
+fn legacy_main_startup_shortcut() -> Option<PathBuf> {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .map(|app_data| {
+            app_data
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("Startup")
+                .join("Llama Switcher.lnk")
+        })
+}
+
+#[cfg(windows)]
+fn main_autostart_enabled() -> bool {
+    let run_enabled = query_registry_string(WINDOWS_RUN_KEY, Some(MAIN_PRODUCT_NAME)).is_some()
+        && startup_approval_enabled(WINDOWS_STARTUP_APPROVED_RUN_KEY, MAIN_PRODUCT_NAME);
+    let shortcut_enabled = legacy_main_startup_shortcut().is_some_and(|path| path.is_file())
+        && startup_approval_enabled(WINDOWS_STARTUP_APPROVED_FOLDER_KEY, "Llama Switcher.lnk");
+    run_enabled || shortcut_enabled
+}
+
+#[cfg(not(windows))]
+fn main_autostart_enabled() -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn delete_registry_value(key: &str, name: &str) {
+    let _ = hidden_windows_command("reg.exe")
+        .args(["delete", key, "/v", name, "/f"])
+        .status();
+}
+
+#[cfg(windows)]
+fn configure_main_autostart(enabled: bool) -> Result<bool, String> {
+    if enabled {
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("Could not locate Llama Switcher: {error}"))?;
+        let quoted_executable = format!("\"{}\"", executable.display());
+        let status = hidden_windows_command("reg.exe")
+            .args([
+                "add",
+                WINDOWS_RUN_KEY,
+                "/v",
+                MAIN_PRODUCT_NAME,
+                "/t",
+                "REG_SZ",
+                "/d",
+                &quoted_executable,
+                "/f",
+            ])
+            .status()
+            .map_err(|error| format!("Could not enable Windows startup: {error}"))?;
+        if !status.success() {
+            return Err("Windows rejected the Llama Switcher startup registration.".into());
+        }
+        delete_registry_value(WINDOWS_STARTUP_APPROVED_RUN_KEY, MAIN_PRODUCT_NAME);
+    } else {
+        delete_registry_value(WINDOWS_RUN_KEY, MAIN_PRODUCT_NAME);
+        delete_registry_value(WINDOWS_STARTUP_APPROVED_RUN_KEY, MAIN_PRODUCT_NAME);
+    }
+
+    // Migrate away from the installer's legacy Startup-folder shortcut. Its
+    // independent approval state caused the installer and app to disagree.
+    if let Some(shortcut) = legacy_main_startup_shortcut() {
+        let _ = std::fs::remove_file(shortcut);
+    }
+    delete_registry_value(WINDOWS_STARTUP_APPROVED_FOLDER_KEY, "Llama Switcher.lnk");
+
+    let actual = main_autostart_enabled();
+    if actual != enabled {
+        return Err("Windows did not retain the requested startup setting.".into());
+    }
+    Ok(actual)
+}
+
+#[cfg(not(windows))]
+fn configure_main_autostart(_enabled: bool) -> Result<bool, String> {
+    Err("Windows startup is available only on Windows.".into())
+}
+
+#[tauri::command]
+async fn get_main_autostart_status() -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(main_autostart_enabled)
+        .await
+        .map_err(|error| format!("Startup status worker stopped unexpectedly: {error}"))
+}
+
+#[tauri::command]
+async fn set_main_autostart(enabled: bool) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || configure_main_autostart(enabled))
+        .await
+        .map_err(|error| format!("Startup settings worker stopped unexpectedly: {error}"))?
+}
+#[cfg(windows)]
 fn widget_executable_path() -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(directory) = query_registry_string(
-        r"HKCU\Software\llamaswitcher\Llama Switcher Widget",
-        None,
-    ) {
+    if let Some(directory) =
+        query_registry_string(r"HKCU\Software\llamaswitcher\Llama Switcher Widget", None)
+    {
         candidates.push(PathBuf::from(directory).join(WIDGET_EXE_NAME));
     }
     if let Some(directory) = query_registry_string(
@@ -554,21 +686,32 @@ fn widget_executable_path() -> Option<PathBuf> {
     }
     if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
         candidates.push(local.join(WIDGET_PRODUCT_NAME).join(WIDGET_EXE_NAME));
-        candidates.push(local.join("Programs").join(WIDGET_PRODUCT_NAME).join(WIDGET_EXE_NAME));
+        candidates.push(
+            local
+                .join("Programs")
+                .join(WIDGET_PRODUCT_NAME)
+                .join(WIDGET_EXE_NAME),
+        );
     }
     candidates.into_iter().find(|path| path.is_file())
 }
 
 #[cfg(not(windows))]
-fn widget_executable_path() -> Option<PathBuf> { None }
+fn widget_executable_path() -> Option<PathBuf> {
+    None
+}
 
 fn widget_status() -> WidgetInstallStatus {
     let executable = widget_executable_path();
     let start_with_windows = {
         #[cfg(windows)]
-        { query_registry_string(WINDOWS_RUN_KEY, Some(WIDGET_PRODUCT_NAME)).is_some() }
+        {
+            query_registry_string(WINDOWS_RUN_KEY, Some(WIDGET_PRODUCT_NAME)).is_some()
+        }
         #[cfg(not(windows))]
-        { false }
+        {
+            false
+        }
     };
     WidgetInstallStatus {
         installed: executable.is_some(),
@@ -580,7 +723,9 @@ fn widget_status() -> WidgetInstallStatus {
 fn resolve_widget_installer(app: &AppHandle) -> Option<PathBuf> {
     if let Ok(resources) = app.path().resource_dir() {
         let bundled = resources.join("widget").join(WIDGET_INSTALLER_NAME);
-        if bundled.is_file() { return Some(bundled); }
+        if bundled.is_file() {
+            return Some(bundled);
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -594,7 +739,9 @@ fn resolve_widget_installer(app: &AppHandle) -> Option<PathBuf> {
             .join("bundle")
             .join("nsis")
             .join("Llama Switcher Widget_0.1.0_x64-setup.exe");
-        if development.is_file() { return Some(development); }
+        if development.is_file() {
+            return Some(development);
+        }
     }
     None
 }
@@ -605,15 +752,23 @@ fn configure_widget_autostart(executable: &Path, enabled: bool) -> Result<(), St
         let quoted_executable = format!("\"{}\"", executable.display());
         hidden_windows_command("reg.exe")
             .args([
-                "add", WINDOWS_RUN_KEY, "/v", WIDGET_PRODUCT_NAME,
-                "/t", "REG_SZ", "/d", &quoted_executable, "/f",
+                "add",
+                WINDOWS_RUN_KEY,
+                "/v",
+                WIDGET_PRODUCT_NAME,
+                "/t",
+                "REG_SZ",
+                "/d",
+                &quoted_executable,
+                "/f",
             ])
             .status()
     } else {
         hidden_windows_command("reg.exe")
             .args(["delete", WINDOWS_RUN_KEY, "/v", WIDGET_PRODUCT_NAME, "/f"])
             .status()
-    }.map_err(|error| format!("Could not update Windows startup: {error}"))?;
+    }
+    .map_err(|error| format!("Could not update Windows startup: {error}"))?;
 
     // `reg delete` returns 1 when the value did not exist, which already means
     // the requested disabled state has been achieved.
@@ -636,7 +791,10 @@ async fn get_widget_install_status() -> Result<WidgetInstallStatus, String> {
 }
 
 #[tauri::command]
-async fn install_widget(app: AppHandle, start_with_windows: bool) -> Result<WidgetInstallStatus, String> {
+async fn install_widget(
+    app: AppHandle,
+    start_with_windows: bool,
+) -> Result<WidgetInstallStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let installer = resolve_widget_installer(&app)
             .ok_or_else(|| "The bundled widget installer could not be found. Reinstall or update Llama Switcher and try again.".to_string())?;
@@ -792,6 +950,8 @@ pub fn run() {
             browse_folder,
             detect_hermes_skill_dirs,
             install_hermes_skill,
+            get_main_autostart_status,
+            set_main_autostart,
             get_widget_install_status,
             install_widget,
             get_benchmark_config,
@@ -806,7 +966,9 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_favorite_profile_ids, parse_registry_string};
+    use super::{
+        normalize_favorite_profile_ids, parse_registry_string, parse_startup_approval_enabled,
+    };
     use std::collections::HashSet;
 
     #[test]
@@ -824,6 +986,13 @@ mod tests {
         assert_eq!(saved, vec!["beta", "alpha"]);
     }
 
+    #[test]
+    fn windows_startup_disabled_state_is_parsed() {
+        let disabled = "    Llama Switcher.lnk    REG_BINARY    0300000015EDF0A62126DD01";
+        let enabled = "    Llama Switcher    REG_BINARY    020000000000000000000000";
+        assert_eq!(parse_startup_approval_enabled(disabled), Some(false));
+        assert_eq!(parse_startup_approval_enabled(enabled), Some(true));
+    }
     #[test]
     fn widget_install_path_is_parsed_from_reg_output() {
         let output = r#"

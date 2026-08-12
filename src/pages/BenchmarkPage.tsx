@@ -50,6 +50,7 @@ export function BenchmarkPage({
   const [prompts, setPrompts] = useState<BenchmarkPrompt[]>([]);
   const [outputDir, setOutputDir] = useState("");
   const [timeoutSeconds, setTimeoutSeconds] = useState(600);
+  const [modelStartTimeoutSeconds, setModelStartTimeoutSeconds] = useState(300);
   const [modelFilter, setModelFilter] = useState("");
   const [activePromptId, setActivePromptId] = useState<string | null>(null);
 
@@ -75,6 +76,7 @@ export function BenchmarkPage({
         setActivePromptId(cfg.prompts[0]?.id ?? null);
         setOutputDir(cfg.outputDir);
         setTimeoutSeconds(cfg.timeoutSeconds);
+        setModelStartTimeoutSeconds(cfg.modelStartTimeoutSeconds ?? 300);
         setRunning(isRunning);
         const valid = cfg.profileIds.filter((id) => profs.some((p) => p.id === id));
         setSelectedIds(valid.length > 0 ? valid : profs.slice(0, 2).map((p) => p.id));
@@ -216,6 +218,7 @@ export function BenchmarkPage({
         prompts,
         outputDir,
         timeoutSeconds,
+        modelStartTimeoutSeconds,
       });
       showToast("Benchmark started.");
     } catch (e) {
@@ -245,7 +248,7 @@ export function BenchmarkPage({
           <div><b>{selectedIds.length}</b><span>Models</span></div>
           <div><b>{prompts.length}</b><span>Prompts</span></div>
           <div><b>{totalJobs}</b><span>Total runs</span></div>
-          <div><b>{formatHMS(timeoutSeconds)}</b><span>Timeout</span></div>
+          <div><b>{formatHMS(modelStartTimeoutSeconds)}</b><span>Model startup</span></div>
         </div>
         <div className="benchmark-primary-action">
           {running ? (
@@ -338,7 +341,7 @@ export function BenchmarkPage({
         <div className="benchmark-panel-heading">
           <div>
             <span className="benchmark-step">03</span>
-            <div><h2>Output & limits</h2><p>Choose where artifacts are saved and how long each response may run.</p></div>
+            <div><h2>Output & limits</h2><p>Choose where artifacts are saved and allow large models enough time to load.</p></div>
           </div>
         </div>
         <div className="benchmark-output-grid">
@@ -353,6 +356,10 @@ export function BenchmarkPage({
           <label className="benchmark-timeout">
             <span>Per-prompt timeout</span>
             <div><input type="number" min={1} value={timeoutSeconds} onChange={(event) => setTimeoutSeconds(Number(event.target.value))} disabled={running} /><b>seconds</b></div>
+          </label>
+          <label className="benchmark-timeout">
+            <span>Model startup timeout</span>
+            <div><input type="number" min={1} value={modelStartTimeoutSeconds} onChange={(event) => setModelStartTimeoutSeconds(Number(event.target.value))} disabled={running} /><b>seconds</b></div>
           </label>
         </div>
       </section>

@@ -12,6 +12,8 @@ export function SettingsPage({
   const [settings, setSettings] = useState<Settings | null>(null);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [busy, setBusy] = useState(false);
+  const [mainAutostart, setMainAutostart] = useState<boolean | null>(null);
+  const [mainAutostartBusy, setMainAutostartBusy] = useState(false);
   const [widgetStatus, setWidgetStatus] = useState<WidgetInstallStatus | null>(null);
   const [widgetInstalling, setWidgetInstalling] = useState(false);
   const [widgetPromptOpen, setWidgetPromptOpen] = useState(false);
@@ -28,6 +30,14 @@ export function SettingsPage({
           .then(setProfiles)
           .catch((error) => console.warn("Could not load profile choices", error));
 
+        // Windows startup detection is also independent so Settings renders
+        // immediately even if the registry is momentarily busy.
+        void api.getMainAutostartStatus()
+          .then(setMainAutostart)
+          .catch((error) => {
+            console.warn("Could not determine Windows startup status", error);
+            setMainAutostart(false);
+          });
         // Widget detection can touch the Windows registry. It is deliberately
         // non-blocking so the settings form is usable as soon as its own data
         // arrives.
@@ -105,6 +115,20 @@ export function SettingsPage({
     }
   }
 
+  async function toggleMainAutostart(enabled: boolean) {
+    setMainAutostartBusy(true);
+    try {
+      const actual = await api.setMainAutostart(enabled);
+      setMainAutostart(actual);
+      showToast(actual
+        ? "Llama Switcher will start with Windows."
+        : "Windows startup is disabled for Llama Switcher.");
+    } catch (error) {
+      showToast(`Could not update Windows startup: ${String(error)}`, true);
+    } finally {
+      setMainAutostartBusy(false);
+    }
+  }
   async function installWidget(startWithWindows: boolean) {
     setWidgetPromptOpen(false);
     setWidgetInstalling(true);
@@ -320,6 +344,22 @@ export function SettingsPage({
 
       <div className="card">
         <h2 style={{ marginTop: 0 }}>Startup &amp; scanning</h2>
+        <div className="field">
+          <label className="inline">
+            <input
+              type="checkbox"
+              checked={mainAutostart ?? false}
+              disabled={mainAutostart === null || mainAutostartBusy}
+              onChange={(event) => void toggleMainAutostart(event.target.checked)}
+            />
+            Start Llama Switcher with Windows
+          </label>
+          <span className="hint">
+            {mainAutostart === null
+              ? "Checking Windows startup status…"
+              : "Controls whether the app itself launches when you sign in. This is separate from script rescanning and profile auto-start."}
+          </span>
+        </div>
         <div className="field">
           <label className="inline">
             <input

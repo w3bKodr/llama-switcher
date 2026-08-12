@@ -17,11 +17,22 @@
   Delete "$DESKTOP\${PRODUCTNAME}.lnk"
   CreateShortcut "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe" "" "$INSTDIR\desktop-icon.ico" 0
 
-  ; ---- Autostart (shell:startup) ----
-  MessageBox MB_YESNO|MB_ICONQUESTION "Start Llama Switcher automatically when you sign in?" IDNO lbl_skip_autostart
+  ; ---- Autostart (HKCU Run) ----
+  ; Use one registry-backed source of truth shared with the Settings toggle.
+  ; Clear legacy shortcut/approval state so an old Windows-disabled shortcut
+  ; cannot override the user's selection during an upgrade.
+  MessageBox MB_YESNO|MB_ICONQUESTION "Start Llama Switcher automatically when you sign in?" IDNO lbl_disable_autostart
     Delete "$SMSTARTUP\${PRODUCTNAME}.lnk"
-    CreateShortcut "$SMSTARTUP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe" "" "$INSTDIR\desktop-icon.ico" 0
-  lbl_skip_autostart:
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder" "${PRODUCTNAME}.lnk"
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCTNAME}" '$"$INSTDIR\${MAINBINARYNAME}.exe$"'
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "${PRODUCTNAME}"
+    Goto lbl_autostart_done
+  lbl_disable_autostart:
+    Delete "$SMSTARTUP\${PRODUCTNAME}.lnk"
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCTNAME}"
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "${PRODUCTNAME}"
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder" "${PRODUCTNAME}.lnk"
+  lbl_autostart_done:
 
   ; ---- Optional Hermes skill install ----
   MessageBox MB_YESNO|MB_ICONQUESTION "Install the Hermes Agent skill now?$\r$\n$\r$\n(You can also do this later from the app's Agent Control page, which also writes your API token automatically.)" IDNO lbl_skip_hermes
@@ -62,6 +73,9 @@
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
-  ; Remove the autostart shortcut if present.
+  ; Remove both current and legacy autostart registrations.
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCTNAME}"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "${PRODUCTNAME}"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder" "${PRODUCTNAME}.lnk"
   Delete "$SMSTARTUP\${PRODUCTNAME}.lnk"
 !macroend

@@ -52,6 +52,9 @@ export const api = {
   installHermesSkill: (targetDir: string) =>
     invoke<string>("install_hermes_skill", { targetDir }),
 
+  getMainAutostartStatus: () => invoke<boolean>("get_main_autostart_status"),
+  setMainAutostart: (enabled: boolean) =>
+    invoke<boolean>("set_main_autostart", { enabled }),
   getWidgetInstallStatus: () =>
     invoke<WidgetInstallStatus>("get_widget_install_status"),
   installWidget: (startWithWindows: boolean) =>

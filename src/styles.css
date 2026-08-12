@@ -1464,7 +1464,7 @@ pre.code-block {
 .benchmark-output-grid label { display: flex; flex-direction: column; gap: 5px; color: var(--text-dim); font-size: 9px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.05em; }
 .bench-textarea { min-height: 112px; padding: 9px 10px; border-radius: 8px; line-height: 1.45; }
 
-.benchmark-output-grid { display: grid; grid-template-columns: minmax(0, 1fr) 190px; gap: 14px; }
+.benchmark-output-grid { display: grid; grid-template-columns: minmax(0, 1fr) 170px 170px; gap: 14px; }
 .benchmark-output-path > div { display: flex; gap: 7px; }
 .benchmark-output-path small { color: var(--text-dim); font-size: 9px; font-weight: 400; line-height: 1.35; text-transform: none; letter-spacing: 0; }
 .benchmark-timeout > div { display: flex; align-items: center; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-input); }
