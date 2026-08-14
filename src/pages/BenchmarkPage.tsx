@@ -150,6 +150,10 @@ export function BenchmarkPage({
         .filter((p): p is Profile => !!p),
     [selectedIds, profiles]
   );
+  const enabledPrompts = useMemo(
+    () => prompts.filter((prompt) => prompt.enabled !== false),
+    [prompts],
+  );
   const visibleProfiles = useMemo(() => {
     const filter = modelFilter.trim().toLowerCase();
     if (!filter) return profiles;
@@ -166,7 +170,7 @@ export function BenchmarkPage({
     }, []),
     [visibleProfiles],
   );
-  const totalJobs = selectedProfiles.length * prompts.length;
+  const totalJobs = selectedProfiles.length * enabledPrompts.length;
   const finishedJobs = Object.values(cells).filter((state) => state === "done" || state === "error").length;
   const progressPercent = totalJobs > 0 ? Math.min(100, (finishedJobs / totalJobs) * 100) : 0;
 
@@ -185,7 +189,7 @@ export function BenchmarkPage({
     while (prompts.some((prompt) => prompt.id === id)) {
       id = `prompt${promptSeq.current++}`;
     }
-    setPrompts((ps) => [...ps, { id, title: "New prompt", text: "" }]);
+    setPrompts((ps) => [...ps, { id, title: "New prompt", text: "", enabled: true }]);
     setActivePromptId(id);
   }
 
@@ -210,7 +214,7 @@ export function BenchmarkPage({
 
   async function run() {
     if (selectedIds.length === 0) return showToast("Select at least one model.", true);
-    if (prompts.length === 0) return showToast("Add at least one prompt.", true);
+    if (enabledPrompts.length === 0) return showToast("Select at least one prompt.", true);
     if (!outputDir.trim()) return showToast("Choose an output folder.", true);
     try {
       await api.runBenchmark({
@@ -242,11 +246,11 @@ export function BenchmarkPage({
         <div className="benchmark-hero-copy">
           <span className="status-kicker">Evaluation workspace</span>
           <h1>Benchmark</h1>
-          <p>Compare every selected model against the same prompt set in a controlled sequence.</p>
+          <p>Compare every selected model against only the prompts you choose.</p>
         </div>
         <div className="benchmark-run-summary">
           <div><b>{selectedIds.length}</b><span>Models</span></div>
-          <div><b>{prompts.length}</b><span>Prompts</span></div>
+          <div><b>{enabledPrompts.length}</b><span>Prompts</span></div>
           <div><b>{totalJobs}</b><span>Total runs</span></div>
           <div><b>{formatHMS(modelStartTimeoutSeconds)}</b><span>Model startup</span></div>
         </div>
@@ -309,20 +313,28 @@ export function BenchmarkPage({
         <div className="benchmark-panel-heading">
           <div>
             <span className="benchmark-step">02</span>
-            <div><h2>Build prompt set</h2><p>Each prompt runs once against every selected model.</p></div>
+            <div><h2>Choose prompt set</h2><p>Check the prompts to run; skipped prompts stay saved for later.</p></div>
           </div>
-          <button className="btn small" onClick={addPrompt} disabled={running}>
-            + Add prompt
-          </button>
+          <div className="benchmark-heading-actions">
+            <span className="benchmark-selection-count">{enabledPrompts.length} of {prompts.length} selected</span>
+            <button className="text-button" disabled={running || enabledPrompts.length === prompts.length} onClick={() => setPrompts((items) => items.map((prompt) => ({ ...prompt, enabled: true })))}>Select all</button>
+            <button className="text-button" disabled={running || enabledPrompts.length === 0} onClick={() => setPrompts((items) => items.map((prompt) => ({ ...prompt, enabled: false })))}>Clear</button>
+            <button className="btn small" onClick={addPrompt} disabled={running}>+ Add prompt</button>
+          </div>
         </div>
         <div className="benchmark-prompts">
           {prompts.map((p, i) => {
             const expanded = activePromptId === p.id;
-            return <article key={p.id} className={`bench-prompt ${expanded ? "expanded" : ""}`}>
+            const enabled = p.enabled !== false;
+            return <article key={p.id} className={`bench-prompt ${enabled ? "selected" : "excluded"} ${expanded ? "expanded" : ""}`}>
               <div className="bench-prompt-header">
+                <label className="bench-prompt-select" title={enabled ? "Included in this run" : "Skipped in this run"}>
+                  <input type="checkbox" checked={enabled} onChange={(event) => updatePrompt(i, { enabled: event.target.checked })} disabled={running} aria-label={`${enabled ? "Exclude" : "Include"} ${p.title || `prompt ${i + 1}`}`} />
+                  <span>{enabled ? "✓" : ""}</span>
+                </label>
                 <button className="bench-prompt-toggle" type="button" onClick={() => setActivePromptId(expanded ? null : p.id)}>
                   <span>{String(i + 1).padStart(2, "0")}</span>
-                  <span><b>{p.title || `Prompt ${i + 1}`}</b><small>{p.text.trim() ? `${p.text.trim().length} characters` : "Empty prompt"}</small></span>
+                  <span><b>{p.title || `Prompt ${i + 1}`}</b><small>{enabled ? "Included" : "Skipped"} · {p.text.trim() ? `${p.text.trim().length} characters` : "Empty prompt"}</small></span>
                   <i>{expanded ? "−" : "+"}</i>
                 </button>
                 <button className="icon-button danger" title="Remove prompt" aria-label={`Remove ${p.title || `prompt ${i + 1}`}`} onClick={() => removePrompt(i)} disabled={running || prompts.length <= 1}>×</button>
@@ -365,7 +377,7 @@ export function BenchmarkPage({
       </section>
 
       {/* Progress grid */}
-      {selectedProfiles.length > 0 && (
+      {selectedProfiles.length > 0 && enabledPrompts.length > 0 && (
         <section className="benchmark-panel benchmark-progress-panel">
           <div className="benchmark-progress-heading">
             <div><span className={`run-indicator ${running ? "active" : ""}`} /><div><h2>{running ? "Benchmark in progress" : "Run preview"}</h2><p>{finishedJobs} of {totalJobs} evaluations complete</p></div></div>
@@ -377,9 +389,9 @@ export function BenchmarkPage({
               <thead>
                 <tr>
                   <th>Model</th>
-                  {prompts.map((p, i) => (
+                  {enabledPrompts.map((p) => (
                     <th key={p.id} title={p.title}>
-                      #{i + 1}
+                      #{prompts.findIndex((prompt) => prompt.id === p.id) + 1}
                     </th>
                   ))}
                   <th></th>
@@ -395,7 +407,7 @@ export function BenchmarkPage({
                         {ms === "switching" && <span className="badge yellow">switching…</span>}
                         {ms === "error" && <span className="badge red">error</span>}
                       </td>
-                      {prompts.map((p) => {
+                      {enabledPrompts.map((p) => {
                         const key = cellKey(prof.id, p.id);
                         const cs = cells[key] ?? "pending";
                         const dur = durations[key];

@@ -20,6 +20,12 @@ pub struct BenchmarkPrompt {
     pub id: String,
     pub title: String,
     pub text: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -98,11 +104,13 @@ pub fn default_config() -> BenchmarkConfig {
                 id: "prompt1".into(),
                 title: "Chess PGN → SVG".into(),
                 text: CHESS_PROMPT.into(),
+                enabled: true,
             },
             BenchmarkPrompt {
                 id: "prompt2".into(),
                 title: "Parallax car canvas".into(),
                 text: CAR_PROMPT.into(),
+                enabled: true,
             },
         ],
         output_dir: String::new(),
@@ -170,8 +178,8 @@ pub fn start(app: AppHandle, state: Arc<AppState>, config: BenchmarkConfig) -> R
     if config.profile_ids.is_empty() {
         return Err("Select at least one model.".into());
     }
-    if config.prompts.is_empty() {
-        return Err("Add at least one prompt.".into());
+    if !config.prompts.iter().any(|prompt| prompt.enabled) {
+        return Err("Select at least one prompt.".into());
     }
     if config.output_dir.trim().is_empty() {
         return Err("Choose an output folder.".into());
@@ -274,7 +282,12 @@ fn run_inner(app: &AppHandle, state: &Arc<AppState>, config: BenchmarkConfig, ge
         let origin = process_manager::server_origin(&settings.health_url, settings.server_port);
         let model_dir = Path::new(&config.output_dir).join(sanitize_alias(&profile.alias));
 
-        for (i, prompt) in config.prompts.iter().enumerate() {
+        for (i, prompt) in config
+            .prompts
+            .iter()
+            .enumerate()
+            .filter(|(_, prompt)| prompt.enabled)
+        {
             if cancelled(state, generation) {
                 break 'models;
             }
@@ -684,11 +697,13 @@ mod tests {
     #[test]
     fn legacy_config_gets_large_model_start_timeout() {
         let config: BenchmarkConfig = serde_json::from_str(
-            r#"{"profileIds":[],"prompts":[],"outputDir":"","timeoutSeconds":600}"#,
+            r#"{"profileIds":[],"prompts":[{"id":"legacy","title":"Legacy","text":"test"}],"outputDir":"","timeoutSeconds":600}"#,
         )
         .expect("legacy benchmark config should deserialize");
 
         assert_eq!(config.model_start_timeout_seconds, 300);
+        assert!(config.prompts[0].enabled);
         assert_eq!(default_config().model_start_timeout_seconds, 300);
+        assert!(default_config().prompts.iter().all(|prompt| prompt.enabled));
     }
 }

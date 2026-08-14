@@ -1349,7 +1349,7 @@ pre.code-block {
   font-weight: 700;
 }
 
-.benchmark-heading-actions { display: flex; align-items: center; gap: 10px; }
+.benchmark-heading-actions { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 6px 10px; }
 .text-button { padding: 3px; border: 0; background: transparent; color: var(--accent); cursor: pointer; font-size: 10px; }
 .text-button:hover { text-decoration: underline; }
 .text-button:disabled { color: var(--text-dim); cursor: default; opacity: 0.5; text-decoration: none; }
@@ -1445,10 +1445,19 @@ pre.code-block {
 .benchmark-empty span { margin-top: 3px; font-size: 10px; }
 
 .benchmark-prompts { display: grid; gap: 7px; }
-.bench-prompt { margin: 0; padding: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: rgba(0, 0, 0, 0.09); }
+.benchmark-selection-count { color: var(--text-dim); font-size: 9px; font-weight: 650; white-space: nowrap; }
+.bench-prompt { margin: 0; padding: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: rgba(0, 0, 0, 0.09); transition: border-color 140ms ease, background 140ms ease, opacity 140ms ease; }
 .bench-prompt:first-of-type { margin: 0; padding: 0; border-top: 1px solid var(--border); }
-.bench-prompt.expanded { border-color: rgba(110, 168, 254, 0.42); }
+.bench-prompt.selected { border-color: rgba(110, 168, 254, 0.34); background: rgba(110, 168, 254, 0.045); }
+.bench-prompt.expanded { border-color: rgba(110, 168, 254, 0.58); }
+.bench-prompt.excluded:not(.expanded) { opacity: 0.58; }
 .bench-prompt-header { display: flex; align-items: stretch; min-height: 48px; }
+.bench-prompt-select { position: relative; display: grid; flex-shrink: 0; width: 42px; place-items: center; border-right: 1px solid var(--border); cursor: pointer; }
+.bench-prompt-select input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.bench-prompt-select span { display: grid; width: 21px; height: 21px; place-items: center; border: 1px solid #555d69; border-radius: 6px; color: white; font-size: 11px; }
+.bench-prompt.selected .bench-prompt-select span { border-color: var(--accent); background: var(--accent-strong); box-shadow: 0 0 0 3px rgba(110, 168, 254, 0.08); }
+.bench-prompt-select:has(input:focus-visible) span { outline: 2px solid var(--accent); outline-offset: 2px; }
+.bench-prompt-select:has(input:disabled) { cursor: default; }
 .bench-prompt-toggle { display: flex; align-items: center; flex: 1; min-width: 0; gap: 10px; padding: 8px 10px; border: 0; background: transparent; color: var(--text); cursor: pointer; text-align: left; }
 .bench-prompt-toggle > span:first-child { display: grid; flex-shrink: 0; width: 25px; height: 25px; place-items: center; border-radius: 7px; background: var(--bg-input); color: var(--text-dim); font-size: 9px; font-weight: 700; }
 .bench-prompt-toggle > span:nth-child(2) { display: flex; overflow: hidden; flex: 1; flex-direction: column; min-width: 0; }

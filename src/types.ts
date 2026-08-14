@@ -87,6 +87,7 @@ export interface BenchmarkPrompt {
   id: string;
   title: string;
   text: string;
+  enabled: boolean;
 }
 
 export interface BenchmarkConfig {

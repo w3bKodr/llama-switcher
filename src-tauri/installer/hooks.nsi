@@ -24,7 +24,7 @@
   MessageBox MB_YESNO|MB_ICONQUESTION "Start Llama Switcher automatically when you sign in?" IDNO lbl_disable_autostart
     Delete "$SMSTARTUP\${PRODUCTNAME}.lnk"
     DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder" "${PRODUCTNAME}.lnk"
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCTNAME}" '$"$INSTDIR\${MAINBINARYNAME}.exe$"'
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCTNAME}" '$\"$INSTDIR\${MAINBINARYNAME}.exe$\"'
     DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "${PRODUCTNAME}"
     Goto lbl_autostart_done
   lbl_disable_autostart:

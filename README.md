@@ -13,6 +13,8 @@ logic) and a small **React + TypeScript + Vite** dashboard.
   control the app. Hermes never runs scripts directly.
 - An optional transparent desktop widget shows the loaded model, feature, VRAM,
   generation speed, and live usage without opening the full dashboard.
+- Benchmark runs can target any subset of saved prompts; skipped prompts remain
+  available for future runs and are excluded from run counts and progress.
 
 > **Hermes is not a llama.cpp model/profile.** It is a separate agent that
 > controls Llama Switcher through the local API or the `hermes-skill/` adapter.
