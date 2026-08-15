@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
+use tauri_plugin_notification::NotificationExt;
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -356,6 +357,8 @@ fn run_inner(app: &AppHandle, state: &Arc<AppState>, config: BenchmarkConfig, ge
 }
 
 fn run_finished(app: &AppHandle, state: &Arc<AppState>, previous: Option<String>, status: String) {
+    let notification = benchmark_completion_notification(&status);
+
     // Restore whatever was running before the benchmark — but only if it isn't
     // already the running model (e.g. the last benchmarked model was the
     // original), to avoid a pointless stop/relaunch.
@@ -387,6 +390,16 @@ fn run_finished(app: &AppHandle, state: &Arc<AppState>, previous: Option<String>
         },
     );
     process_manager::notify(app, state);
+    if let Some((title, body)) = notification {
+        let _ = app.notification().builder().title(title).body(body).show();
+    }
+}
+
+fn benchmark_completion_notification(status: &str) -> Option<(&'static str, &'static str)> {
+    (status == "finished").then_some((
+        "Benchmark complete",
+        "All selected model and prompt runs have finished.",
+    ))
 }
 
 fn wait_healthy(app: &AppHandle, state: &Arc<AppState>, timeout_s: u64, generation: u64) -> bool {
@@ -705,5 +718,18 @@ mod tests {
         assert!(config.prompts[0].enabled);
         assert_eq!(default_config().model_start_timeout_seconds, 300);
         assert!(default_config().prompts.iter().all(|prompt| prompt.enabled));
+    }
+
+    #[test]
+    fn completion_notification_only_shows_for_finished_runs() {
+        assert_eq!(
+            benchmark_completion_notification("finished"),
+            Some((
+                "Benchmark complete",
+                "All selected model and prompt runs have finished."
+            ))
+        );
+        assert_eq!(benchmark_completion_notification("cancelled"), None);
+        assert_eq!(benchmark_completion_notification("error"), None);
     }
 }
