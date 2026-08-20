@@ -35,4 +35,5 @@ export interface WidgetSettings {
   refreshSeconds: number;
   startWithWindows: boolean;
   alwaysOnTop: boolean;
+  desktopMode: boolean;
 }

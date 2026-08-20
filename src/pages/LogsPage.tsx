@@ -145,7 +145,22 @@ export function LogsPage({
     }
   }
 
+  async function copyLogToClipboard() {
+    if (!text) {
+      showToast("There is no log content to copy.", true);
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast("Log copied to clipboard.");
+    } catch (e) {
+      showToast(`Could not copy log: ${String(e)}`, true);
+    }
+  }
+
   const currentIsLatest = !!selected && logs[0]?.path === selected;
+  const lineCount = text ? text.split(/\r?\n/).length : 0;
 
   return (
     <div>
@@ -190,6 +205,12 @@ export function LogsPage({
       </div>
 
       <LogViewer key={selected ?? "no-log"} text={text} follow={currentIsLatest} />
+      <div className="log-actions">
+        <span>{lineCount ? `${lineCount.toLocaleString()} lines` : "No log content"}</span>
+        <button className="btn" disabled={!text} onClick={() => void copyLogToClipboard()}>
+          Copy log to clipboard
+        </button>
+      </div>
     </div>
   );
 }

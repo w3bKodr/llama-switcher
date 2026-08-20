@@ -20,10 +20,14 @@ pub struct Settings {
     pub allowed_extensions: Vec<String>,
     pub server_port: u16,
     pub health_url: String,
-    /// Optional llama.cpp server API key. Used only for protected status probes
-    /// such as `/slots`; profile scripts are also scanned for LLAMA_API_KEY.
+    /// Optional fallback server API key. It is injected as `LLAMA_API_KEY` when
+    /// launching a profile and is also used for protected status probes.
     #[serde(default)]
     pub llama_server_api_key: Option<String>,
+    /// Refuse to launch profiles unless a usable API key can be resolved. The
+    /// default is intentionally secure, including for older settings files.
+    #[serde(default = "default_require_server_api_key")]
+    pub require_server_api_key: bool,
     pub agent_api_port: u16,
     pub agent_api_token: String,
     pub auto_rescan_on_startup: bool,
@@ -50,6 +54,10 @@ fn default_server_process_names() -> Vec<String> {
     vec!["llama-server.exe".into()]
 }
 
+fn default_require_server_api_key() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -59,6 +67,7 @@ impl Default for Settings {
             server_port: 1234,
             health_url: "http://127.0.0.1:1234/health".to_string(),
             llama_server_api_key: None,
+            require_server_api_key: true,
             agent_api_port: 47891,
             agent_api_token: generate_token(),
             auto_rescan_on_startup: true,
@@ -103,5 +112,22 @@ impl Settings {
         }
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         std::fs::write(path, text).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_launch_protection_defaults_on_for_older_settings_files() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("requireServerApiKey");
+
+        let loaded: Settings = serde_json::from_value(value).unwrap();
+        assert!(loaded.require_server_api_key);
     }
 }

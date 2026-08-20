@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, PhysicalPosition } from "@tauri-apps/api/window";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
-import { Activity, Box, BrainCircuit, Eye, ExternalLink, Gauge, MemoryStick, Minus, Pin, RefreshCw, ServerOff, Settings2, Sparkles, X, Zap } from "lucide-react";
+import { Activity, Box, BrainCircuit, Eye, ExternalLink, Gauge, Layers3, MemoryStick, Minus, Pin, RefreshCw, ServerOff, Settings2, Sparkles, X, Zap } from "lucide-react";
 import type { LlamaStatus, WidgetSettings } from "./types";
 
 const POSITION_KEY = "llama-switcher-widget.position.v1";
@@ -16,11 +16,13 @@ const defaultSettings: WidgetSettings = {
   refreshSeconds: 3,
   startWithWindows: false,
   alwaysOnTop: false,
+  desktopMode: false,
 };
 
 function loadSettings(): WidgetSettings {
   try {
-    return { ...defaultSettings, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? "{}") };
+    const loaded = { ...defaultSettings, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? "{}") };
+    return loaded.desktopMode ? { ...loaded, alwaysOnTop: false } : loaded;
   } catch {
     return defaultSettings;
   }
@@ -160,7 +162,8 @@ export default function App() {
         void appWindow.setPosition(new PhysicalPosition(position.x, position.y));
       }
     } catch { /* Ignore stale position data. */ }
-    void appWindow.setAlwaysOnTop(settings.alwaysOnTop);
+    void appWindow.setAlwaysOnBottom(settings.desktopMode);
+    void appWindow.setAlwaysOnTop(settings.alwaysOnTop && !settings.desktopMode);
     void isEnabled().then((enabled) => {
       setSettings((current) => current.startWithWindows === enabled ? current : { ...current, startWithWindows: enabled });
     });
@@ -186,8 +189,21 @@ export default function App() {
   };
 
   const toggleAlwaysOnTop = async (next: boolean) => {
-    if (isTauriRuntime()) await getCurrentWindow().setAlwaysOnTop(next);
-    updateSettings({ alwaysOnTop: next });
+    if (isTauriRuntime()) {
+      const appWindow = getCurrentWindow();
+      if (next) await appWindow.setAlwaysOnBottom(false);
+      await appWindow.setAlwaysOnTop(next);
+    }
+    updateSettings(next ? { alwaysOnTop: true, desktopMode: false } : { alwaysOnTop: false });
+  };
+
+  const toggleDesktopMode = async (next: boolean) => {
+    if (isTauriRuntime()) {
+      const appWindow = getCurrentWindow();
+      if (next) await appWindow.setAlwaysOnTop(false);
+      await appWindow.setAlwaysOnBottom(next);
+    }
+    updateSettings(next ? { desktopMode: true, alwaysOnTop: false } : { desktopMode: false });
   };
 
   const startWindowDrag = (event: ReactMouseEvent<HTMLElement>) => {
@@ -253,6 +269,10 @@ export default function App() {
               <input aria-label="Glass blur" type="range" min="0" max="36" value={settings.blur} onChange={(event) => updateSettings({ blur: Number(event.target.value) })} />
             </section>
 
+            <section className="setting-row">
+              <div><strong><Layers3 size={14} /> Desktop mode</strong><span>Keep the widget behind other windows</span></div>
+              <Toggle label="Desktop mode" checked={settings.desktopMode} onChange={(next) => void toggleDesktopMode(next)} />
+            </section>
             <section className="setting-row">
               <div><strong><Pin size={14} /> Always on top</strong><span>Keep telemetry above other windows</span></div>
               <Toggle label="Always on top" checked={settings.alwaysOnTop} onChange={(next) => void toggleAlwaysOnTop(next)} />

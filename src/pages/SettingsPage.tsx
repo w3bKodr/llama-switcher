@@ -252,17 +252,34 @@ export function SettingsPage({
           />
         </div>
         <div className="field">
-          <label>llama.cpp API key for status probes</label>
+          <label>Fallback server API key</label>
           <input
             type="password"
             className="mono"
             value={settings.llamaServerApiKey ?? ""}
             onChange={(e) => update("llamaServerApiKey", e.target.value || null)}
-            placeholder="Auto-detected from LLAMA_API_KEY when blank"
+            placeholder="Auto-detected from the profile or environment when blank"
           />
           <span className="hint">
-            Used only if the running profile script does not set LLAMA_API_KEY.
-            Script keys are preferred so each model can use its own key.
+            Used when a profile does not provide its own key. Llama Switcher
+            passes this as LLAMA_API_KEY and uses it for authenticated
+            status and benchmark requests.
+          </span>
+        </div>
+        <div className="field">
+          <label className="inline">
+            <input
+              type="checkbox"
+              checked={settings.requireServerApiKey}
+              onChange={(e) => update("requireServerApiKey", e.target.checked)}
+            />
+            Require API key protection before server launch
+          </label>
+          <span className="hint">
+            Blocks Start, Switch, Restart, benchmark launches, and startup
+            profiles unless a usable key is detected from LLAMA_API_KEY,
+            --api-key, --api-key-file, the inherited environment, or the
+            fallback key above. Enabled by default.
           </span>
         </div>
         <div className="field">

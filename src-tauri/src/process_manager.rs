@@ -124,7 +124,7 @@ pub fn status_with_probe(app: &AppHandle, state: &Arc<AppState>) -> Status {
     } else {
         *state.external_pid_checked.lock().unwrap() = None;
     }
-    s.usage_state = if health.healthy && !*state.usage_probe_disabled.lock().unwrap() {
+    s.usage_state = if health.healthy {
         probe_usage_state(state, &s)
     } else {
         UsageState::Unknown
@@ -392,17 +392,19 @@ fn probe_avg_tps(state: &Arc<AppState>, status: &Status) -> Option<f64> {
     probe_log_tps(state)
 }
 
-/// Source 1: llama.cpp `/metrics` cumulative counters, reusing the `/slots`
-/// API key. Returns None on 401/missing so the log fallback can run.
+/// Source 1: llama.cpp `/metrics` cumulative counters. A bearer key is added
+/// when the active profile configures one; local servers without auth are
+/// probed without a header. Returns None on failure so the log fallback can run.
 fn probe_metrics_tps(state: &Arc<AppState>, status: &Status) -> Option<f64> {
-    let api_key = usage_probe_api_key(state, status)?;
-    let url = format!("{}/metrics", server_origin(&status.health_url, status.server_port));
+    let api_key = usage_probe_api_key(state, status);
+    let url = format!(
+        "{}/metrics",
+        server_origin(&status.health_url, status.server_port)
+    );
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(800))
         .build();
-    let body = agent
-        .get(&url)
-        .set("Authorization", &format!("Bearer {}", api_key))
+    let body = with_optional_bearer(agent.get(&url), api_key.as_deref())
         .call()
         .ok()?
         .into_string()
@@ -504,45 +506,131 @@ fn parse_prometheus_metric(body: &str, name: &str) -> Option<f64> {
 }
 
 fn probe_usage_state(state: &Arc<AppState>, status: &Status) -> UsageState {
-    let api_key = match usage_probe_api_key(state, status) {
-        Some(key) => key,
-        None => return UsageState::Unknown,
+    // BeeLlama can block `/slots` for the entire duration of a heavy multimodal
+    // generation. Its run log already provides an authoritative slot lifecycle,
+    // so skip the endpoint while the latest event says the slot is processing.
+    let initial_log_state = probe_log_usage_state(state);
+    if initial_log_state == Some(UsageState::Busy) {
+        return remember_usage_state(state, status, initial_log_state);
+    }
+
+    let endpoint_state = if *state.usage_probe_disabled.lock().unwrap() {
+        None
+    } else {
+        probe_slots_usage_state(state, status)
     };
+    // Re-read after an endpoint timeout because the launch or release line may
+    // have been flushed while the request was waiting.
+    let observed = endpoint_state.or_else(|| probe_log_usage_state(state)).or(initial_log_state);
+    remember_usage_state(state, status, observed)
+}
+
+fn probe_slots_usage_state(state: &Arc<AppState>, status: &Status) -> Option<UsageState> {
+    let api_key = usage_probe_api_key(state, status);
 
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(800))
         .build();
 
-    let url = format!("{}/slots", server_origin(&status.health_url, status.server_port));
-    let auth = format!("Bearer {}", api_key);
-    let response = match agent.get(&url).set("Authorization", &auth).call() {
+    let url = format!(
+        "{}/slots",
+        server_origin(&status.health_url, status.server_port)
+    );
+    let response = match with_optional_bearer(agent.get(&url), api_key.as_deref()).call() {
         Ok(response) => response,
         Err(ureq::Error::Status(401 | 403, _)) => {
             *state.usage_probe_disabled.lock().unwrap() = true;
-            return UsageState::Unknown;
+            return None;
         }
-        Err(_) => return UsageState::Unknown,
+        Err(_) => return None,
     };
 
-    let body = match response.into_string() {
-        Ok(body) => body,
-        Err(_) => return UsageState::Unknown,
-    };
+    let body = response.into_string().ok()?;
+    let value: Value = serde_json::from_str(&body).ok()?;
 
-    let value: Value = match serde_json::from_str(&body) {
-        Ok(value) => value,
-        Err(_) => return UsageState::Unknown,
-    };
+    infer_usage_state(&value)
+}
 
-    infer_usage_state(&value).unwrap_or(UsageState::Unknown)
+fn probe_log_usage_state(state: &Arc<AppState>) -> Option<UsageState> {
+    let log_path = state
+        .running
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|process| process.log_path.clone())?;
+    let tail = read_file_tail(&log_path, 256 * 1024)?;
+    infer_log_usage_state(&tail)
+}
+
+fn read_file_tail(path: &std::path::Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::with_capacity((len - start) as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    if start == 0 {
+        Some(text.into_owned())
+    } else {
+        Some(text.split_once('\n')?.1.to_string())
+    }
+}
+
+fn infer_log_usage_state(text: &str) -> Option<UsageState> {
+    for line in text.lines().rev() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("all slots are idle")
+            || (lower.contains("slot") && lower.contains("release:") && lower.contains("stop processing"))
+            || lower.contains("llama_server: model loaded")
+        {
+            return Some(UsageState::Free);
+        }
+        if (lower.contains("slot")
+            && lower.contains("launch_slot_")
+            && lower.contains("processing task"))
+            || (lower.contains("slot print_timing:") && lower.contains("prompt processing"))
+        {
+            return Some(UsageState::Busy);
+        }
+    }
+    None
+}
+
+fn remember_usage_state(
+    state: &Arc<AppState>,
+    status: &Status,
+    observed: Option<UsageState>,
+) -> UsageState {
+    let mut tracker = state.usage.lock().unwrap();
+    if tracker.profile_id != status.current_profile_id || tracker.pid != status.pid {
+        tracker.profile_id = status.current_profile_id.clone();
+        tracker.pid = status.pid;
+        tracker.last_known = None;
+    }
+    if let Some(observed) = observed {
+        tracker.last_known = Some(observed);
+        observed
+    } else {
+        tracker.last_known.unwrap_or(UsageState::Unknown)
+    }
+}
+
+fn with_optional_bearer(request: ureq::Request, api_key: Option<&str>) -> ureq::Request {
+    match api_key {
+        Some(api_key) => request.set("Authorization", &format!("Bearer {api_key}")),
+        None => request,
+    }
 }
 
 fn usage_probe_api_key(state: &Arc<AppState>, status: &Status) -> Option<String> {
     resolve_api_key(state, status.script_path.as_deref())
 }
 
-/// Resolve the llama.cpp bearer key: the profile script's `LLAMA_API_KEY` /
-/// `--api-key` first, then the settings fallback. Shared by the usage probe,
+/// Resolve the llama.cpp bearer key from `LLAMA_API_KEY`, `--api-key`, or
+/// `--api-key-file`, then use the settings fallback. Shared by the usage probe,
 /// the metrics probe, and the benchmark runner.
 pub fn resolve_api_key(state: &Arc<AppState>, script_path: Option<&str>) -> Option<String> {
     let script_key = script_path
@@ -552,7 +640,10 @@ pub fn resolve_api_key(state: &Arc<AppState>, script_path: Option<&str>) -> Opti
         .settings_snapshot()
         .llama_server_api_key
         .and_then(|key| non_empty(key.trim()));
-    script_key.or(fallback_settings_key)
+    let inherited_key = std::env::var("LLAMA_API_KEY")
+        .ok()
+        .and_then(|key| non_empty(key.trim()));
+    script_key.or(fallback_settings_key).or(inherited_key)
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -561,10 +652,33 @@ fn non_empty(value: &str) -> Option<String> {
 
 fn api_key_from_script(path: &str) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
-    parse_api_key_from_script(&text)
+    if let Some(raw_key) = parse_inline_api_key_from_script(&text) {
+        return expand_script_variables(&text, &raw_key)
+            .and_then(|key| non_empty(key.trim()));
+    }
+
+    if let Some(raw_key_path) = parse_api_key_file_from_script(&text) {
+        let expanded_key_path = expand_script_variables(&text, &raw_key_path)?;
+        let key_path = std::path::PathBuf::from(expanded_key_path);
+        let key_path = if key_path.is_absolute() {
+            key_path
+        } else {
+            std::path::Path::new(path).parent()?.join(key_path)
+        };
+        return read_api_key_file(&key_path);
+    }
+
+    parse_env_api_key_from_script(&text).and_then(|raw_key| {
+        expand_script_variables(&text, &raw_key).and_then(|key| non_empty(key.trim()))
+    })
 }
 
+#[cfg(test)]
 fn parse_api_key_from_script(text: &str) -> Option<String> {
+    parse_inline_api_key_from_script(text).or_else(|| parse_env_api_key_from_script(text))
+}
+
+fn parse_inline_api_key_from_script(text: &str) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim();
         let lower = trimmed.to_ascii_lowercase();
@@ -572,14 +686,108 @@ fn parse_api_key_from_script(text: &str) -> Option<String> {
             continue;
         }
 
-        if let Some(value) = parse_env_assignment(trimmed, "LLAMA_API_KEY") {
-            return Some(value);
-        }
         if let Some(value) = parse_flag_value(trimmed, "--api-key") {
             return Some(value);
         }
     }
     None
+}
+
+fn parse_env_api_key_from_script(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| parse_env_assignment(line.trim(), "LLAMA_API_KEY"))
+}
+
+fn parse_api_key_file_from_script(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if trimmed.is_empty() || lower.starts_with("rem ") || lower.starts_with('#') {
+            return None;
+        }
+        parse_flag_value(trimmed, "--api-key-file")
+    })
+}
+
+fn expand_script_variables(text: &str, value: &str) -> Option<String> {
+    let mut expanded = value.to_string();
+    for _ in 0..16 {
+        if let Some(start) = expanded.find('%') {
+            let end = start + 1 + expanded[start + 1..].find('%')?;
+            let name = &expanded[start + 1..end];
+            let replacement = resolve_script_variable(text, name)?;
+            expanded.replace_range(start..=end, &replacement);
+            continue;
+        }
+        if let Some(start) = expanded.find('!') {
+            let end = start + 1 + expanded[start + 1..].find('!')?;
+            let name = &expanded[start + 1..end];
+            let replacement = resolve_script_variable(text, name)?;
+            expanded.replace_range(start..=end, &replacement);
+            continue;
+        }
+        let lower = expanded.to_ascii_lowercase();
+        if let Some(start) = lower.find("${env:") {
+            let end = start + 6 + expanded[start + 6..].find('}')?;
+            let name = &expanded[start + 6..end];
+            let replacement = resolve_script_variable(text, name)?;
+            expanded.replace_range(start..=end, &replacement);
+            continue;
+        }
+        if let Some(start) = lower.find("$env:") {
+            let name_start = start + 5;
+            let name_len = expanded[name_start..]
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .map(char::len_utf8)
+                .sum::<usize>();
+            if name_len == 0 {
+                return None;
+            }
+            let end = name_start + name_len;
+            let name = &expanded[name_start..end];
+            let replacement = resolve_script_variable(text, name)?;
+            expanded.replace_range(start..end, &replacement);
+            continue;
+        }
+        return Some(expanded);
+    }
+    None
+}
+
+fn resolve_script_variable(text: &str, name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    text.lines()
+        .find_map(|line| parse_env_assignment(line.trim(), name))
+        .or_else(|| std::env::var(name).ok())
+}
+
+fn validate_api_key_for_launch(
+    required: bool,
+    api_key: Option<&str>,
+    profile_alias: &str,
+) -> Result<(), String> {
+    if !required || api_key.is_some_and(|key| !key.trim().is_empty()) {
+        return Ok(());
+    }
+    Err(format!(
+        "Server launch blocked by API key protection: '{}' does not provide a usable API key. Configure LLAMA_API_KEY, --api-key, --api-key-file, an inherited LLAMA_API_KEY environment variable, or the fallback key in Settings.",
+        profile_alias
+    ))
+}
+
+fn read_api_key_file(path: &std::path::Path) -> Option<String> {
+    // API key files should be tiny. Refuse unexpectedly large files so a bad
+    // profile cannot make a recurring status probe read arbitrary bulk data.
+    if std::fs::metadata(path).ok()?.len() > 64 * 1024 {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .map(|line| line.trim().trim_start_matches('\u{feff}'))
+        .find_map(non_empty)
 }
 
 fn parse_env_assignment(line: &str, name: &str) -> Option<String> {
@@ -607,14 +815,36 @@ fn parse_env_assignment(line: &str, name: &str) -> Option<String> {
 fn parse_flag_value(line: &str, flag: &str) -> Option<String> {
     let lower = line.to_ascii_lowercase();
     let flag_lower = flag.to_ascii_lowercase();
-    let pos = lower.find(&flag_lower)?;
+    let mut search_from = 0;
+    let pos = loop {
+        let relative = lower[search_from..].find(&flag_lower)?;
+        let pos = search_from + relative;
+        let end = pos + flag.len();
+        let before_ok = pos == 0 || lower[..pos].chars().next_back()?.is_whitespace();
+        let after_ok = lower[end..]
+            .chars()
+            .next()
+            .map(|ch| ch.is_whitespace() || ch == '=')
+            .unwrap_or(true);
+        if before_ok && after_ok {
+            break pos;
+        }
+        search_from = end;
+    };
     let after = line[pos + flag.len()..].trim_start();
     let value = if let Some(value) = after.strip_prefix('=') {
         value.trim_start()
     } else {
         after
     };
-    Some(clean_script_value(value))
+    let token = match value.chars().next()? {
+        quote @ ('"' | '\'') => {
+            let closing = value[1..].find(quote)? + 1;
+            &value[..=closing]
+        }
+        _ => value.split_whitespace().next()?,
+    };
+    Some(clean_script_value(token))
 }
 
 fn clean_script_value(value: &str) -> String {
@@ -1018,6 +1248,15 @@ pub fn activate_profile(
         ));
     }
 
+    // Resolve and validate credentials before acquiring the operation lock or
+    // stopping an existing server. A rejected switch must not cause downtime.
+    let api_key = resolve_api_key(state, Some(&profile.script_path));
+    validate_api_key_for_launch(
+        settings.require_server_api_key,
+        api_key.as_deref(),
+        &profile.alias,
+    )?;
+
     // Serialize the entire start/switch so two activations cannot race and
     // leave two servers running. Held until the new server is launched.
     let _op = state.op_lock.lock().unwrap();
@@ -1047,7 +1286,7 @@ pub fn activate_profile(
 
     // Create the run log and launch the script.
     let log_path = logging::create_run_log(&state.logs_dir, &profile, None);
-    let child = spawn_script(&profile, &log_path)?;
+    let child = spawn_script(&profile, &log_path, api_key.as_deref())?;
     let pid = child.id();
     let started_at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     logging::append_line(&log_path, &format!("Launched shell PID {}.", pid));
@@ -1126,7 +1365,11 @@ fn stop_external_listener(
     ))
 }
 
-fn spawn_script(profile: &Profile, log_path: &std::path::Path) -> Result<std::process::Child, String> {
+fn spawn_script(
+    profile: &Profile,
+    log_path: &std::path::Path,
+    api_key: Option<&str>,
+) -> Result<std::process::Child, String> {
     let ext = profile.extension.to_lowercase();
     let mut cmd;
     if ext == ".ps1" {
@@ -1148,6 +1391,11 @@ fn spawn_script(profile: &Profile, log_path: &std::path::Path) -> Result<std::pr
     }
 
     cmd.current_dir(&profile.working_directory);
+    if let Some(api_key) = api_key {
+        // Ensures the fallback setting protects the launched server too; keys
+        // supplied explicitly by the profile remain authoritative.
+        cmd.env("LLAMA_API_KEY", api_key);
+    }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.stdin(Stdio::null());
@@ -1581,6 +1829,50 @@ mod tests {
     }
 
     #[test]
+    fn infers_busy_usage_from_recent_beellama_slot_lifecycle() {
+        let log = r#"
+            I slot      release: id 0 | task 12 | stop processing
+            I slot launch_slot_: id 0 | task 126 | processing task, is_child = 0
+            W srv stop: cancel task, id_task = 133
+            I slot print_timing: id 0 | task 126 | prompt processing, n_tokens = 913
+            W srv stop: cancel task, id_task = 134
+        "#;
+
+        assert_eq!(infer_log_usage_state(log), Some(UsageState::Busy));
+    }
+
+    #[test]
+    fn infers_free_usage_after_beellama_releases_the_slot() {
+        let log = r#"
+            I slot launch_slot_: id 0 | task 126 | processing task, is_child = 0
+            I slot print_timing: id 0 | task 126 | eval time = 1000 ms / 20 tokens
+            I slot      release: id 0 | task 126 | stop processing: n_tokens = 20
+            W srv stop: cancel task, id_task = 126
+        "#;
+
+        assert_eq!(infer_log_usage_state(log), Some(UsageState::Free));
+    }
+
+    #[test]
+    fn treats_a_loaded_server_as_free_before_its_first_request() {
+        let log = "I srv llama_server: model loaded";
+        assert_eq!(infer_log_usage_state(log), Some(UsageState::Free));
+    }
+
+    #[test]
+    fn usage_probe_allows_servers_without_api_keys() {
+        let request = with_optional_bearer(ureq::get("http://127.0.0.1/slots"), None);
+        assert_eq!(request.header("Authorization"), None);
+
+        let authenticated =
+            with_optional_bearer(ureq::get("http://127.0.0.1/slots"), Some("test-key"));
+        assert_eq!(
+            authenticated.header("Authorization"),
+            Some("Bearer test-key")
+        );
+    }
+
+    #[test]
     fn parses_cmd_llama_api_key_assignment() {
         let script = r#"
             @echo off
@@ -1600,5 +1892,89 @@ mod tests {
         "#;
 
         assert_eq!(parse_api_key_from_script(script).as_deref(), Some("sk-flag-456"));
+    }
+
+    #[test]
+    fn command_line_api_key_takes_precedence_over_environment_assignment() {
+        let script = r#"
+            set "LLAMA_API_KEY=environment-key"
+            llama-server.exe --api-key command-line-key
+        "#;
+
+        assert_eq!(
+            parse_api_key_from_script(script).as_deref(),
+            Some("command-line-key")
+        );
+    }
+
+    #[test]
+    fn api_key_flag_does_not_match_api_key_file_prefix() {
+        let script = r#"llama-server.exe --api-key-file "%APPDATA%\keys.txt""#;
+        assert_eq!(parse_api_key_from_script(script), None);
+        assert_eq!(
+            parse_api_key_file_from_script(script).as_deref(),
+            Some("%APPDATA%\\keys.txt")
+        );
+    }
+
+    #[test]
+    fn resolves_api_key_from_cmd_key_file_variable() {
+        let temp_dir = std::env::temp_dir();
+        let unique = format!(
+            "llama-switcher-api-key-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let key_path = temp_dir.join(&unique);
+        let script_path = temp_dir.join(format!("{unique}.cmd"));
+        std::fs::write(&key_path, "test-key-from-file\n").unwrap();
+        std::fs::write(
+            &script_path,
+            format!(
+                "set \"LLAMA_API_KEY_FILE=%TEMP%\\{unique}\"\r\nllama-server.exe --api-key-file \"%LLAMA_API_KEY_FILE%\"\r\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            api_key_from_script(script_path.to_str().unwrap()).as_deref(),
+            Some("test-key-from-file")
+        );
+
+        let _ = std::fs::remove_file(key_path);
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[test]
+    fn expands_common_cmd_and_powershell_api_key_variables() {
+        let cmd = "set \"PROFILE_KEY=cmd-key\"";
+        assert_eq!(
+            expand_script_variables(cmd, "%PROFILE_KEY%").as_deref(),
+            Some("cmd-key")
+        );
+        assert_eq!(
+            expand_script_variables(cmd, "!PROFILE_KEY!").as_deref(),
+            Some("cmd-key")
+        );
+
+        let powershell = "$env:PROFILE_KEY = 'powershell-key'";
+        assert_eq!(
+            expand_script_variables(powershell, "$env:PROFILE_KEY").as_deref(),
+            Some("powershell-key")
+        );
+        assert_eq!(
+            expand_script_variables(powershell, "${env:PROFILE_KEY}").as_deref(),
+            Some("powershell-key")
+        );
+    }
+
+    #[test]
+    fn api_key_launch_protection_is_secure_by_default_but_can_be_disabled() {
+        assert!(validate_api_key_for_launch(true, None, "Unprotected profile").is_err());
+        assert!(validate_api_key_for_launch(true, Some("configured"), "Protected").is_ok());
+        assert!(validate_api_key_for_launch(false, None, "Explicitly allowed").is_ok());
     }
 }

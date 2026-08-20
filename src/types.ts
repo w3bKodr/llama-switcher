@@ -35,6 +35,7 @@ export interface Settings {
   serverPort: number;
   healthUrl: string;
   llamaServerApiKey: string | null;
+  requireServerApiKey: boolean;
   agentApiPort: number;
   agentApiToken: string;
   autoRescanOnStartup: boolean;

@@ -38,6 +38,9 @@ pub struct AppState {
     /// If the llama.cpp API protects `/slots`, disable usage probing for the
     /// current run after the first 401/403 so logs do not fill with retries.
     pub usage_probe_disabled: Mutex<bool>,
+    /// Last authoritative or log-derived usage result for the current server
+    /// process. Used only when a transient `/slots` request cannot complete.
+    pub usage: Mutex<UsageTracker>,
     /// Baseline for the average generation tokens/sec, reset per model switch.
     pub tps: Mutex<TpsTracker>,
     /// True while a benchmark run owns the server; blocks manual switching.
@@ -73,6 +76,13 @@ pub struct TpsTracker {
     pub log_gen_ms: f64,
 }
 
+#[derive(Default)]
+pub struct UsageTracker {
+    pub profile_id: Option<String>,
+    pub pid: Option<u32>,
+    pub last_known: Option<UsageState>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum UsageState {
@@ -92,6 +102,7 @@ impl AppState {
             takeover_lock: Mutex::new(()),
             external_pid_checked: Mutex::new(None),
             usage_probe_disabled: Mutex::new(false),
+            usage: Mutex::new(UsageTracker::default()),
             tps: Mutex::new(TpsTracker::default()),
             benchmark_running: Mutex::new(false),
             benchmark_cancel: Mutex::new(false),
