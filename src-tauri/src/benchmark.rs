@@ -39,6 +39,8 @@ pub struct BenchmarkConfig {
     pub timeout_seconds: u64,
     #[serde(default = "default_model_start_timeout")]
     pub model_start_timeout_seconds: u64,
+    #[serde(default = "default_runs_per_prompt")]
+    pub runs_per_prompt: u32,
 }
 
 fn default_timeout() -> u64 {
@@ -47,6 +49,10 @@ fn default_timeout() -> u64 {
 
 fn default_model_start_timeout() -> u64 {
     300
+}
+
+fn default_runs_per_prompt() -> u32 {
+    1
 }
 
 #[derive(Serialize, Clone)]
@@ -65,6 +71,13 @@ struct Progress {
     duration_seconds: Option<f64>,
     /// Average generation tokens/sec reported by the server for this prompt.
     tokens_per_second: Option<f64>,
+    /// One-based repetition currently running or just completed.
+    run_index: Option<u32>,
+    run_count: Option<u32>,
+    /// Raw totals let the UI calculate a correctly weighted rate across cells.
+    draft_tokens: Option<u64>,
+    accepted_draft_tokens: Option<u64>,
+    speculative_acceptance_rate: Option<f64>,
 }
 
 fn emit(app: &AppHandle, p: Progress) {
@@ -117,6 +130,7 @@ pub fn default_config() -> BenchmarkConfig {
         output_dir: String::new(),
         timeout_seconds: 600,
         model_start_timeout_seconds: default_model_start_timeout(),
+        runs_per_prompt: default_runs_per_prompt(),
     }
 }
 
@@ -162,6 +176,11 @@ fn invalidate_run(app: &AppHandle, state: &Arc<AppState>) {
                 message: None,
                 duration_seconds: None,
                 tokens_per_second: None,
+                run_index: None,
+                run_count: None,
+                draft_tokens: None,
+                accepted_draft_tokens: None,
+                speculative_acceptance_rate: None,
             },
         );
         process_manager::notify(app, state);
@@ -184,6 +203,9 @@ pub fn start(app: AppHandle, state: Arc<AppState>, config: BenchmarkConfig) -> R
     }
     if config.output_dir.trim().is_empty() {
         return Err("Choose an output folder.".into());
+    }
+    if !(1..=100).contains(&config.runs_per_prompt) {
+        return Err("Runs per prompt must be between 1 and 100.".into());
     }
     let generation = {
         let mut running = state.benchmark_running.lock().unwrap();
@@ -217,6 +239,11 @@ fn run_inner(app: &AppHandle, state: &Arc<AppState>, config: BenchmarkConfig, ge
             message: None,
             duration_seconds: None,
             tokens_per_second: None,
+            run_index: None,
+            run_count: Some(config.runs_per_prompt),
+            draft_tokens: None,
+            accepted_draft_tokens: None,
+            speculative_acceptance_rate: None,
         },
     );
 
@@ -293,55 +320,124 @@ fn run_inner(app: &AppHandle, state: &Arc<AppState>, config: BenchmarkConfig, ge
                 break 'models;
             }
             let prompt_dir = model_dir.join(format!("prompt{}", i + 1));
+            let mut results = Vec::new();
+            let mut errors = Vec::new();
+
+            for run_index in 1..=config.runs_per_prompt {
+                if cancelled(state, generation) {
+                    break 'models;
+                }
+                let run_dir = if config.runs_per_prompt == 1 {
+                    prompt_dir.clone()
+                } else {
+                    prompt_dir.join(format!("run-{run_index:02}"))
+                };
+                emit_prompt(
+                    app,
+                    profile_id,
+                    &profile.alias,
+                    &prompt.id,
+                    "running",
+                    &run_dir,
+                    None,
+                    None,
+                    None,
+                    Some(run_index),
+                    Some(config.runs_per_prompt),
+                    None,
+                    None,
+                );
+
+                let result = run_prompt_cancellable(
+                    state,
+                    generation,
+                    &origin,
+                    api_key.as_deref(),
+                    prompt,
+                    config.timeout_seconds,
+                    &run_dir,
+                    &profile.alias,
+                    run_index,
+                    config.runs_per_prompt,
+                );
+                if cancelled(state, generation) {
+                    break 'models;
+                }
+                match result {
+                    Ok(result) => {
+                        emit_prompt(
+                            app,
+                            profile_id,
+                            &profile.alias,
+                            &prompt.id,
+                            "iteration_done",
+                            &run_dir,
+                            None,
+                            Some(result.elapsed_seconds),
+                            result.tokens_per_second,
+                            Some(run_index),
+                            Some(config.runs_per_prompt),
+                            result.draft_tokens,
+                            result.accepted_draft_tokens,
+                        );
+                        results.push(result);
+                    }
+                    Err(e) => {
+                        emit_prompt(
+                            app,
+                            profile_id,
+                            &profile.alias,
+                            &prompt.id,
+                            "iteration_error",
+                            &run_dir,
+                            Some(e.clone()),
+                            None,
+                            None,
+                            Some(run_index),
+                            Some(config.runs_per_prompt),
+                            None,
+                            None,
+                        );
+                        errors.push(format!("Run {run_index}: {e}"));
+                    }
+                }
+            }
+
+            let aggregate = PromptAggregate::from_results(&results);
+            let _ = write_prompt_summary(
+                &prompt_dir,
+                &profile.alias,
+                prompt,
+                config.runs_per_prompt,
+                &aggregate,
+                &errors,
+            );
+            let final_status = if results.is_empty() { "error" } else { "done" };
+            let message = if errors.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "{} of {} repetitions failed: {}",
+                    errors.len(),
+                    config.runs_per_prompt,
+                    errors.join("; ")
+                ))
+            };
             emit_prompt(
                 app,
                 profile_id,
                 &profile.alias,
                 &prompt.id,
-                "running",
+                final_status,
                 &prompt_dir,
+                message,
+                aggregate.average_duration_seconds,
+                aggregate.average_tokens_per_second,
                 None,
-                None,
-                None,
+                Some(config.runs_per_prompt),
+                aggregate.draft_tokens,
+                aggregate.accepted_draft_tokens,
             );
-
-            let result = run_prompt_cancellable(
-                state,
-                generation,
-                &origin,
-                api_key.as_deref(),
-                prompt,
-                config.timeout_seconds,
-                &prompt_dir,
-                &profile.alias,
-            );
-            if cancelled(state, generation) {
-                break 'models;
-            }
-            match result {
-                Ok((elapsed, tps)) => emit_prompt(
-                    app,
-                    profile_id,
-                    &profile.alias,
-                    &prompt.id,
-                    "done",
-                    &prompt_dir,
-                    None,
-                    Some(elapsed),
-                    tps,
-                ),
-                Err(e) => emit_prompt(
-                    app,
-                    profile_id,
-                    &profile.alias,
-                    &prompt.id,
-                    "error",
-                    &prompt_dir,
-                    Some(e),
-                    None,
-                    None,
-                ),
-            }
         }
     }
 
@@ -387,6 +483,11 @@ fn run_finished(app: &AppHandle, state: &Arc<AppState>, previous: Option<String>
             message: None,
             duration_seconds: None,
             tokens_per_second: None,
+            run_index: None,
+            run_count: None,
+            draft_tokens: None,
+            accepted_draft_tokens: None,
+            speculative_acceptance_rate: None,
         },
     );
     process_manager::notify(app, state);
@@ -435,6 +536,11 @@ fn emit_model(
             message,
             duration_seconds: None,
             tokens_per_second: None,
+            run_index: None,
+            run_count: None,
+            draft_tokens: None,
+            accepted_draft_tokens: None,
+            speculative_acceptance_rate: None,
         },
     );
 }
@@ -450,7 +556,12 @@ fn emit_prompt(
     message: Option<String>,
     duration_seconds: Option<f64>,
     tokens_per_second: Option<f64>,
+    run_index: Option<u32>,
+    run_count: Option<u32>,
+    draft_tokens: Option<u64>,
+    accepted_draft_tokens: Option<u64>,
 ) {
+    let speculative_acceptance_rate = weighted_acceptance(draft_tokens, accepted_draft_tokens);
     emit(
         app,
         Progress {
@@ -463,6 +574,11 @@ fn emit_prompt(
             message,
             duration_seconds,
             tokens_per_second,
+            run_index,
+            run_count,
+            draft_tokens,
+            accepted_draft_tokens,
+            speculative_acceptance_rate,
         },
     );
 }
@@ -471,6 +587,74 @@ fn emit_prompt(
 // One prompt against one model
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug)]
+struct PromptResult {
+    elapsed_seconds: f64,
+    tokens_per_second: Option<f64>,
+    draft_tokens: Option<u64>,
+    accepted_draft_tokens: Option<u64>,
+}
+
+#[derive(Default)]
+struct PromptAggregate {
+    successful_runs: usize,
+    average_duration_seconds: Option<f64>,
+    average_tokens_per_second: Option<f64>,
+    draft_tokens: Option<u64>,
+    accepted_draft_tokens: Option<u64>,
+    speculative_acceptance_rate: Option<f64>,
+}
+
+impl PromptAggregate {
+    fn from_results(results: &[PromptResult]) -> Self {
+        let successful_runs = results.len();
+        let average_duration_seconds = average(results.iter().map(|result| result.elapsed_seconds));
+        let average_tokens_per_second =
+            average(results.iter().filter_map(|result| result.tokens_per_second));
+        let draft_tokens = optional_sum(results.iter().filter_map(|result| result.draft_tokens));
+        let accepted_draft_tokens = optional_sum(
+            results
+                .iter()
+                .filter_map(|result| result.accepted_draft_tokens),
+        );
+        let speculative_acceptance_rate = weighted_acceptance(draft_tokens, accepted_draft_tokens);
+        Self {
+            successful_runs,
+            average_duration_seconds,
+            average_tokens_per_second,
+            draft_tokens,
+            accepted_draft_tokens,
+            speculative_acceptance_rate,
+        }
+    }
+}
+
+fn average(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let (sum, count) = values.fold((0.0, 0_u64), |(sum, count), value| (sum + value, count + 1));
+    (count > 0).then_some(sum / count as f64)
+}
+
+fn optional_sum(values: impl Iterator<Item = u64>) -> Option<u64> {
+    let values = values.collect::<Vec<_>>();
+    (!values.is_empty()).then(|| values.into_iter().sum())
+}
+
+fn weighted_acceptance(draft_tokens: Option<u64>, accepted: Option<u64>) -> Option<f64> {
+    match (draft_tokens, accepted) {
+        (Some(drafted), Some(accepted)) if drafted > 0 => Some(accepted as f64 / drafted as f64),
+        _ => None,
+    }
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|number| *number >= 0.0)
+            .map(|number| number as u64)
+    })
+}
+
 fn run_prompt(
     origin: &str,
     api_key: Option<&str>,
@@ -478,7 +662,9 @@ fn run_prompt(
     timeout_s: u64,
     prompt_dir: &Path,
     alias: &str,
-) -> Result<(f64, Option<f64>), String> {
+    run_index: u32,
+    run_count: u32,
+) -> Result<PromptResult, String> {
     std::fs::create_dir_all(prompt_dir).map_err(|e| e.to_string())?;
 
     let agent = ureq::AgentBuilder::new()
@@ -521,6 +707,9 @@ fn run_prompt(
     let timings = &value["timings"];
     let usage = &value["usage"];
     let tokens_per_second = timings["predicted_per_second"].as_f64();
+    let draft_tokens = value_as_u64(&timings["draft_n"]);
+    let accepted_draft_tokens = value_as_u64(&timings["draft_n_accepted"]);
+    let speculative_acceptance_rate = weighted_acceptance(draft_tokens, accepted_draft_tokens);
     let meta = json!({
         "alias": alias,
         "promptId": prompt.id,
@@ -528,6 +717,11 @@ fn run_prompt(
         "predictedTokens": timings["predicted_n"].as_f64().or_else(|| usage["completion_tokens"].as_f64()),
         "promptTokens": timings["prompt_n"].as_f64().or_else(|| usage["prompt_tokens"].as_f64()),
         "tokensPerSecond": tokens_per_second,
+        "runIndex": run_index,
+        "runCount": run_count,
+        "draftTokens": draft_tokens,
+        "acceptedDraftTokens": accepted_draft_tokens,
+        "speculativeAcceptanceRate": speculative_acceptance_rate,
         "durationSeconds": elapsed,
         "finishReason": value["choices"][0]["finish_reason"].as_str(),
         "timestamp": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
@@ -538,7 +732,43 @@ fn run_prompt(
     )
     .map_err(|e| e.to_string())?;
 
-    Ok((elapsed, tokens_per_second))
+    Ok(PromptResult {
+        elapsed_seconds: elapsed,
+        tokens_per_second,
+        draft_tokens,
+        accepted_draft_tokens,
+    })
+}
+
+fn write_prompt_summary(
+    prompt_dir: &Path,
+    alias: &str,
+    prompt: &BenchmarkPrompt,
+    runs_requested: u32,
+    aggregate: &PromptAggregate,
+    errors: &[String],
+) -> Result<(), String> {
+    std::fs::create_dir_all(prompt_dir).map_err(|e| e.to_string())?;
+    let summary = json!({
+        "alias": alias,
+        "promptId": prompt.id,
+        "promptTitle": prompt.title,
+        "runsRequested": runs_requested,
+        "successfulRuns": aggregate.successful_runs,
+        "failedRuns": errors.len(),
+        "averageTokensPerSecond": aggregate.average_tokens_per_second,
+        "averageDurationSeconds": aggregate.average_duration_seconds,
+        "draftTokens": aggregate.draft_tokens,
+        "acceptedDraftTokens": aggregate.accepted_draft_tokens,
+        "weightedSpeculativeAcceptanceRate": aggregate.speculative_acceptance_rate,
+        "errors": errors,
+        "timestamp": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+    });
+    std::fs::write(
+        prompt_dir.join("summary.json"),
+        serde_json::to_string_pretty(&summary).unwrap_or_default(),
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Run the blocking HTTP request on a disposable worker and let the benchmark
@@ -553,7 +783,9 @@ fn run_prompt_cancellable(
     timeout_s: u64,
     prompt_dir: &Path,
     alias: &str,
-) -> Result<(f64, Option<f64>), String> {
+    run_index: u32,
+    run_count: u32,
+) -> Result<PromptResult, String> {
     let (sender, receiver) = mpsc::sync_channel(1);
     let origin = origin.to_string();
     let api_key = api_key.map(str::to_string);
@@ -568,6 +800,8 @@ fn run_prompt_cancellable(
             timeout_s,
             &prompt_dir,
             &alias,
+            run_index,
+            run_count,
         );
         let _ = sender.send(result);
     });
@@ -715,9 +949,49 @@ mod tests {
         .expect("legacy benchmark config should deserialize");
 
         assert_eq!(config.model_start_timeout_seconds, 300);
+        assert_eq!(config.runs_per_prompt, 1);
         assert!(config.prompts[0].enabled);
         assert_eq!(default_config().model_start_timeout_seconds, 300);
+        assert_eq!(default_config().runs_per_prompt, 1);
         assert!(default_config().prompts.iter().all(|prompt| prompt.enabled));
+    }
+
+    #[test]
+    fn aggregates_average_speed_and_weighted_spec_acceptance() {
+        let aggregate = PromptAggregate::from_results(&[
+            PromptResult {
+                elapsed_seconds: 10.0,
+                tokens_per_second: Some(20.0),
+                draft_tokens: Some(100),
+                accepted_draft_tokens: Some(90),
+            },
+            PromptResult {
+                elapsed_seconds: 14.0,
+                tokens_per_second: Some(30.0),
+                draft_tokens: Some(300),
+                accepted_draft_tokens: Some(150),
+            },
+        ]);
+
+        assert_eq!(aggregate.successful_runs, 2);
+        assert_eq!(aggregate.average_duration_seconds, Some(12.0));
+        assert_eq!(aggregate.average_tokens_per_second, Some(25.0));
+        assert_eq!(aggregate.draft_tokens, Some(400));
+        assert_eq!(aggregate.accepted_draft_tokens, Some(240));
+        assert_eq!(aggregate.speculative_acceptance_rate, Some(0.6));
+    }
+
+    #[test]
+    fn omits_acceptance_when_speculative_decoding_is_inactive() {
+        let aggregate = PromptAggregate::from_results(&[PromptResult {
+            elapsed_seconds: 4.0,
+            tokens_per_second: Some(42.0),
+            draft_tokens: None,
+            accepted_draft_tokens: None,
+        }]);
+
+        assert_eq!(aggregate.average_tokens_per_second, Some(42.0));
+        assert_eq!(aggregate.speculative_acceptance_rate, None);
     }
 
     #[test]

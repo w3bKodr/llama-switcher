@@ -17,6 +17,8 @@ function sanitizeAlias(alias: string): string {
 
 type CellState = "pending" | "running" | "done" | "error";
 type ModelState = "pending" | "switching" | "ready" | "error";
+type RepetitionProgress = { current: number; total: number };
+type AcceptanceTotal = { drafted: number; accepted: number };
 
 function cellKey(profileId: string, promptId: string) {
   return `${profileId}::${promptId}`;
@@ -51,6 +53,7 @@ export function BenchmarkPage({
   const [outputDir, setOutputDir] = useState("");
   const [timeoutSeconds, setTimeoutSeconds] = useState(600);
   const [modelStartTimeoutSeconds, setModelStartTimeoutSeconds] = useState(300);
+  const [runsPerPrompt, setRunsPerPrompt] = useState(1);
   const [modelFilter, setModelFilter] = useState("");
   const [activePromptId, setActivePromptId] = useState<string | null>(null);
 
@@ -58,6 +61,9 @@ export function BenchmarkPage({
   const [cells, setCells] = useState<Record<string, CellState>>({});
   const [durations, setDurations] = useState<Record<string, number>>({});
   const [tps, setTps] = useState<Record<string, number>>({});
+  const [repetitionProgress, setRepetitionProgress] = useState<Record<string, RepetitionProgress>>({});
+  const [completedRuns, setCompletedRuns] = useState<Record<string, true>>({});
+  const [acceptanceTotals, setAcceptanceTotals] = useState<Record<string, AcceptanceTotal>>({});
   const [modelStates, setModelStates] = useState<Record<string, ModelState>>({});
   const [errors, setErrors] = useState<string[]>([]);
   const promptSeq = useRef(3);
@@ -77,6 +83,7 @@ export function BenchmarkPage({
         setOutputDir(cfg.outputDir);
         setTimeoutSeconds(cfg.timeoutSeconds);
         setModelStartTimeoutSeconds(cfg.modelStartTimeoutSeconds ?? 300);
+        setRunsPerPrompt(cfg.runsPerPrompt ?? 1);
         setRunning(isRunning);
         const valid = cfg.profileIds.filter((id) => profs.some((p) => p.id === id));
         setSelectedIds(valid.length > 0 ? valid : profs.slice(0, 2).map((p) => p.id));
@@ -105,6 +112,9 @@ export function BenchmarkPage({
           setCells({});
           setDurations({});
           setTps({});
+          setRepetitionProgress({});
+          setCompletedRuns({});
+          setAcceptanceTotals({});
           setModelStates({});
           setErrors([]);
         } else if (p.status === "finished" || p.status === "cancelled") {
@@ -123,18 +133,36 @@ export function BenchmarkPage({
           setErrors((es) => [...es, `${p.alias ?? p.profileId}: ${p.message}`]);
         }
       } else if (p.kind === "prompt" && p.profileId && p.promptId) {
-        const cs: CellState =
-          p.status === "running" ? "running" : p.status === "done" ? "done" : "error";
         const key = cellKey(p.profileId!, p.promptId!);
-        setCells((c) => ({ ...c, [key]: cs }));
+        if (p.status === "running") {
+          setCells((c) => ({ ...c, [key]: "running" }));
+          if (p.runIndex != null && p.runCount != null) {
+            setRepetitionProgress((items) => ({
+              ...items,
+              [key]: { current: p.runIndex!, total: p.runCount! },
+            }));
+          }
+        } else if (p.status === "iteration_done" || p.status === "iteration_error") {
+          if (p.runIndex != null) {
+            setCompletedRuns((items) => ({ ...items, [`${key}::${p.runIndex}`]: true }));
+          }
+          if (p.status === "iteration_error" && p.message) {
+            setErrors((es) => [...es, `${p.alias ?? p.profileId} / ${p.promptId} / run ${p.runIndex ?? "?"}: ${p.message}`]);
+          }
+        } else if (p.status === "done" || p.status === "error") {
+          setCells((c) => ({ ...c, [key]: p.status as CellState }));
+        }
         if (p.status === "done" && p.durationSeconds != null) {
           setDurations((d) => ({ ...d, [key]: p.durationSeconds! }));
         }
         if (p.status === "done" && p.tokensPerSecond != null) {
           setTps((t) => ({ ...t, [key]: p.tokensPerSecond! }));
         }
-        if (p.status === "error" && p.message) {
-          setErrors((es) => [...es, `${p.alias ?? p.profileId} / ${p.promptId}: ${p.message}`]);
+        if ((p.status === "done" || p.status === "error") && p.draftTokens != null && p.acceptedDraftTokens != null) {
+          setAcceptanceTotals((items) => ({
+            ...items,
+            [key]: { drafted: p.draftTokens!, accepted: p.acceptedDraftTokens! },
+          }));
         }
       }
     });
@@ -170,9 +198,21 @@ export function BenchmarkPage({
     }, []),
     [visibleProfiles],
   );
-  const totalJobs = selectedProfiles.length * enabledPrompts.length;
-  const finishedJobs = Object.values(cells).filter((state) => state === "done" || state === "error").length;
+  const totalJobs = selectedProfiles.length * enabledPrompts.length * runsPerPrompt;
+  const finishedJobs = Object.keys(completedRuns).length;
   const progressPercent = totalJobs > 0 ? Math.min(100, (finishedJobs / totalJobs) * 100) : 0;
+  const acceptanceByModel = useMemo(() => {
+    return selectedProfiles.reduce<Record<string, AcceptanceTotal>>((models, profile) => {
+      const totals = enabledPrompts.reduce<AcceptanceTotal>((sum, prompt) => {
+        const item = acceptanceTotals[cellKey(profile.id, prompt.id)];
+        return item
+          ? { drafted: sum.drafted + item.drafted, accepted: sum.accepted + item.accepted }
+          : sum;
+      }, { drafted: 0, accepted: 0 });
+      models[profile.id] = totals;
+      return models;
+    }, {});
+  }, [acceptanceTotals, enabledPrompts, selectedProfiles]);
 
   function toggleModel(id: string) {
     setSelectedIds((ids) =>
@@ -223,6 +263,7 @@ export function BenchmarkPage({
         outputDir,
         timeoutSeconds,
         modelStartTimeoutSeconds,
+        runsPerPrompt,
       });
       showToast("Benchmark started.");
     } catch (e) {
@@ -252,7 +293,7 @@ export function BenchmarkPage({
           <div><b>{selectedIds.length}</b><span>Models</span></div>
           <div><b>{enabledPrompts.length}</b><span>Prompts</span></div>
           <div><b>{totalJobs}</b><span>Total runs</span></div>
-          <div><b>{formatHMS(modelStartTimeoutSeconds)}</b><span>Model startup</span></div>
+          <div><b>{runsPerPrompt}×</b><span>Each prompt</span></div>
         </div>
         <div className="benchmark-primary-action">
           {running ? (
@@ -353,7 +394,7 @@ export function BenchmarkPage({
         <div className="benchmark-panel-heading">
           <div>
             <span className="benchmark-step">03</span>
-            <div><h2>Output & limits</h2><p>Choose where artifacts are saved and allow large models enough time to load.</p></div>
+            <div><h2>Run setup & output</h2><p>Set repetition count, time limits, and where every result is saved.</p></div>
           </div>
         </div>
         <div className="benchmark-output-grid">
@@ -364,6 +405,10 @@ export function BenchmarkPage({
               <button className="btn" onClick={() => void browse()} disabled={running}>Browse…</button>
             </div>
             <small>Organized by model and prompt with the response, extracted code, and metadata.</small>
+          </label>
+          <label className="benchmark-timeout">
+            <span>Runs per prompt</span>
+            <div><input type="number" min={1} max={100} step={1} value={runsPerPrompt} onChange={(event) => setRunsPerPrompt(Math.max(1, Math.min(100, Math.trunc(Number(event.target.value) || 1))))} disabled={running} /><b>times</b></div>
           </label>
           <label className="benchmark-timeout">
             <span>Per-prompt timeout</span>
@@ -394,12 +439,18 @@ export function BenchmarkPage({
                       #{prompts.findIndex((prompt) => prompt.id === p.id) + 1}
                     </th>
                   ))}
+                  <th title="Accepted speculative draft tokens divided by all drafted tokens for this model">Weighted spec acceptance</th>
                   <th></th>
                 </tr>
               </thead>
               <tbody>
                 {selectedProfiles.map((prof) => {
                   const ms = modelStates[prof.id] ?? "pending";
+                  const modelAcceptance = acceptanceByModel[prof.id];
+                  const modelComplete = enabledPrompts.every((prompt) => {
+                    const state = cells[cellKey(prof.id, prompt.id)];
+                    return state === "done" || state === "error";
+                  });
                   return (
                     <tr key={prof.id}>
                       <td>
@@ -412,21 +463,31 @@ export function BenchmarkPage({
                         const cs = cells[key] ?? "pending";
                         const dur = durations[key];
                         const speed = tps[key];
+                        const repeat = repetitionProgress[key];
                         return (
                           <td key={p.id} className={`bench-cell ${cs}`} title={cs}>
                             {cs === "done" ? (
                               <div className="bench-cell-done">
-                                <span>{dur != null ? formatHMS(dur) : "✓"}</span>
+                                <span>{dur != null ? `avg ${formatHMS(dur)}` : "✓"}</span>
                                 {speed != null && (
-                                  <span className="bench-tps">{speed.toFixed(1)} tk/s</span>
+                                  <span className="bench-tps">{speed.toFixed(1)} avg tk/s</span>
                                 )}
                               </div>
+                            ) : cs === "running" && repeat ? (
+                              <div className="bench-cell-running"><span className="spinner" /><b>Run {repeat.current}/{repeat.total}</b></div>
                             ) : (
                               CELL_ICON[cs]
                             )}
                           </td>
                         );
                       })}
+                      <td className="bench-model-acceptance">
+                        {modelAcceptance?.drafted > 0 ? (
+                          <><b>{((modelAcceptance.accepted / modelAcceptance.drafted) * 100).toFixed(1)}%</b><small>{modelAcceptance.accepted.toLocaleString()} / {modelAcceptance.drafted.toLocaleString()} tokens</small></>
+                        ) : (
+                          <><b>—</b><small>{modelComplete ? "No speculative data" : "Awaiting results"}</small></>
+                        )}
+                      </td>
                       <td>
                         <button
                           className="btn small"

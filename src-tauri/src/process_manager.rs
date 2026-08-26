@@ -134,6 +134,11 @@ pub fn status_with_probe(app: &AppHandle, state: &Arc<AppState>) -> Status {
     } else {
         None
     };
+    s.avg_speculative_acceptance_rate = if health.healthy {
+        probe_avg_speculative_acceptance(state, &s)
+    } else {
+        None
+    };
     s.vram = probe_vram(s.pid);
     s
 }
@@ -479,6 +484,76 @@ fn parse_gen_eval_line(line: &str) -> Option<(f64, f64)> {
     let slash = rest.find('/')?;
     let tokens = parse_leading_f64(&rest[slash + 1..])?;
     Some((tokens, ms))
+}
+
+/// Parse and accumulate BeeLlama/llama.cpp speculative-decoding timing lines.
+/// Both MTP and DFlash use the same completed-request format:
+/// `draft acceptance = 0.75000 ( 141 accepted / 188 generated), ...`
+fn probe_avg_speculative_acceptance(
+    state: &Arc<AppState>,
+    status: &Status,
+) -> Option<f64> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let log_path = state
+        .running
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|rp| rp.log_path.clone())?;
+    let mut file = std::fs::File::open(&log_path).ok()?;
+    let len = file.metadata().ok()?.len();
+
+    let mut tracker = state.spec_acceptance.lock().unwrap();
+    if tracker.profile_id != status.current_profile_id || tracker.pid != status.pid {
+        *tracker = crate::state::SpecAcceptanceTracker {
+            profile_id: status.current_profile_id.clone(),
+            pid: status.pid,
+            ..Default::default()
+        };
+    }
+    if tracker.log_offset > len {
+        tracker.log_offset = 0;
+        tracker.accepted_tokens = 0;
+        tracker.generated_tokens = 0;
+    }
+
+    file.seek(SeekFrom::Start(tracker.log_offset)).ok()?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+    let consumed = buf.rfind('\n').map(|index| index + 1).unwrap_or(0);
+    for line in buf[..consumed].lines() {
+        if let Some((accepted, generated)) = parse_draft_acceptance_line(line) {
+            tracker.accepted_tokens = tracker.accepted_tokens.saturating_add(accepted);
+            tracker.generated_tokens = tracker.generated_tokens.saturating_add(generated);
+        }
+    }
+    tracker.log_offset += consumed as u64;
+
+    weighted_spec_acceptance(tracker.accepted_tokens, tracker.generated_tokens)
+}
+
+fn parse_draft_acceptance_line(line: &str) -> Option<(u64, u64)> {
+    let lower = line.to_ascii_lowercase();
+    let marker = lower.find("draft acceptance")?;
+    let after_marker = &line[marker..];
+    let open = after_marker.find('(')?;
+    let counts = &after_marker[open + 1..];
+    let close = counts.find(')')?;
+    let mut parts = counts[..close].split_whitespace();
+    let accepted = parts.next()?.parse::<u64>().ok()?;
+    if !parts.next()?.eq_ignore_ascii_case("accepted") || parts.next()? != "/" {
+        return None;
+    }
+    let generated = parts.next()?.parse::<u64>().ok()?;
+    if !parts.next()?.eq_ignore_ascii_case("generated") || generated == 0 {
+        return None;
+    }
+    Some((accepted, generated))
+}
+
+fn weighted_spec_acceptance(accepted: u64, generated: u64) -> Option<f64> {
+    (generated > 0).then(|| accepted as f64 / generated as f64)
 }
 
 /// Parse the first numeric token (skipping leading whitespace) as f64.
@@ -1283,6 +1358,13 @@ pub fn activate_profile(
             ..Default::default()
         };
     }
+    {
+        let mut tracker = state.spec_acceptance.lock().unwrap();
+        *tracker = crate::state::SpecAcceptanceTracker {
+            profile_id: Some(profile.id.clone()),
+            ..Default::default()
+        };
+    }
 
     // Create the run log and launch the script.
     let log_path = logging::create_run_log(&state.logs_dir, &profile, None);
@@ -1760,6 +1842,20 @@ mod tests {
         let (t2, m2) = parse_gen_eval_line("eval time = 1499.76 ms / 62 tokens ( 24.19 ms per token, 41.34 tokens per second)").unwrap();
         let avg = (t1 + t2) / ((m1 + m2) / 1000.0);
         assert!((avg - 39.78).abs() < 0.1);
+    }
+
+    #[test]
+    fn parses_and_weights_mtp_and_dflash_acceptance_lines() {
+        // BeeLlama emits this shared format for both MTP and DFlash engines.
+        let dflash = "6.40.658.461 I slot print_timing: id  0 | task 48 | draft acceptance = 0.39323 ( 7152 accepted / 18188 generated), mean len = 2.57";
+        let mtp = "7.07.029.786 I slot print_timing: id  0 | task 5131 | draft acceptance = 0.57143 ( 112 accepted / 196 generated), mean len = 3.29";
+        assert_eq!(parse_draft_acceptance_line(dflash), Some((7_152, 18_188)));
+        assert_eq!(parse_draft_acceptance_line(mtp), Some((112, 196)));
+
+        let weighted = weighted_spec_acceptance(7_152 + 112, 18_188 + 196).unwrap();
+        assert!((weighted - 0.39513).abs() < 0.00001);
+        assert_eq!(weighted_spec_acceptance(0, 0), None);
+        assert!(parse_draft_acceptance_line("eval time = 10 ms / 4 tokens").is_none());
     }
 
     fn profile(path: &str, id: &str) -> Profile {

@@ -1247,6 +1247,23 @@ pre.code-block {
   color: var(--text-dim);
 }
 
+.bench-cell-running {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: inherit;
+  font-size: 10px;
+}
+
+.bench-cell-running .spinner {
+  width: 10px;
+  height: 10px;
+  border: 2px solid rgba(240, 198, 116, 0.25);
+  border-top-color: var(--yellow);
+  border-radius: 50%;
+  animation: bench-spin 0.8s linear infinite;
+}
+
 .bench-cell.pending {
   color: var(--text-dim);
 }
@@ -1486,7 +1503,7 @@ pre.code-block {
 .benchmark-output-grid label { display: flex; flex-direction: column; gap: 5px; color: var(--text-dim); font-size: 9px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.05em; }
 .bench-textarea { min-height: 112px; padding: 9px 10px; border-radius: 8px; line-height: 1.45; }
 
-.benchmark-output-grid { display: grid; grid-template-columns: minmax(0, 1fr) 170px 170px; gap: 14px; }
+.benchmark-output-grid { display: grid; grid-template-columns: minmax(0, 1fr) 135px 155px 165px; gap: 12px; }
 .benchmark-output-path > div { display: flex; gap: 7px; }
 .benchmark-output-path small { color: var(--text-dim); font-size: 9px; font-weight: 400; line-height: 1.35; text-transform: none; letter-spacing: 0; }
 .benchmark-timeout > div { display: flex; align-items: center; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-input); }
@@ -1507,8 +1524,17 @@ pre.code-block {
 .bench-grid td { padding: 8px 9px; }
 .bench-grid td:first-child { max-width: 270px; overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .bench-grid .btn.small { padding: 4px 7px; font-size: 9px; }
+.bench-model-acceptance { min-width: 142px; }
+.bench-model-acceptance b { display: block; color: #a987f5; font-size: 13px; font-variant-numeric: tabular-nums; }
+.bench-model-acceptance small { display: block; margin-top: 2px; color: var(--text-dim); font-size: 8px; font-weight: 500; }
 
 @keyframes run-pulse { 50% { opacity: 0.58; transform: scale(0.86); } }
+@keyframes bench-spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 1050px) {
+  .benchmark-output-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .benchmark-output-path { grid-column: 1 / -1; }
+}
 
 @media (max-width: 850px) {
   .benchmark-hero { grid-template-columns: 1fr auto; }

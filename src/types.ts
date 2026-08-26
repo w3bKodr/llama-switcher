@@ -63,6 +63,7 @@ export interface Status {
   healthy: boolean;
   serverReachable: boolean;
   avgTokensPerSecond: number | null;
+  avgSpeculativeAcceptanceRate: number | null;
   serverPort: number;
   healthUrl: string;
   startedAt: string | null;
@@ -97,11 +98,12 @@ export interface BenchmarkConfig {
   outputDir: string;
   timeoutSeconds: number;
   modelStartTimeoutSeconds: number;
+  runsPerPrompt: number;
 }
 
 export interface BenchmarkProgress {
   kind: "run" | "model" | "prompt";
-  status: "running" | "done" | "error" | "switching" | "finished" | "cancelled";
+  status: "running" | "iteration_done" | "iteration_error" | "done" | "error" | "switching" | "finished" | "cancelled";
   profileId: string | null;
   alias: string | null;
   promptId: string | null;
@@ -109,6 +111,11 @@ export interface BenchmarkProgress {
   message: string | null;
   durationSeconds: number | null;
   tokensPerSecond: number | null;
+  runIndex: number | null;
+  runCount: number | null;
+  draftTokens: number | null;
+  acceptedDraftTokens: number | null;
+  speculativeAcceptanceRate: number | null;
 }
 
 export interface AgentApiInfo {

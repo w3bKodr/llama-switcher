@@ -27,14 +27,6 @@ function healthLabel(status: Status) {
   return "Healthy";
 }
 
-function usageLabel(status: Status) {
-  if (!status.serverReachable) return "Unavailable";
-  if (status.running && !status.healthy) return "Waiting for server";
-  if (status.usageState === "busy") return "In use";
-  if (status.usageState === "free") return "Free";
-  return "Unknown";
-}
-
 export function StatusCard({ status }: { status: Status | null }) {
   if (!status) {
     return <div className="card">Loading status...</div>;
@@ -74,13 +66,17 @@ export function StatusCard({ status }: { status: Status | null }) {
               : "—"}
           </span>
         </div>
+        <div className="summary-chip" title="Weighted speculative-decoding acceptance since this model started">
+          <span className="summary-label">Spec accept</span>
+          <span className="summary-value">
+            {status.avgSpeculativeAcceptanceRate != null
+              ? `${(status.avgSpeculativeAcceptanceRate * 100).toFixed(1)}%`
+              : "—"}
+          </span>
+        </div>
         <div className="summary-chip">
           <span className="summary-label">Health</span>
           <span className="summary-value">{healthLabel(status)}</span>
-        </div>
-        <div className="summary-chip">
-          <span className="summary-label">Usage</span>
-          <span className="summary-value">{usageLabel(status)}</span>
         </div>
       </div>
 

@@ -43,6 +43,9 @@ pub struct AppState {
     pub usage: Mutex<UsageTracker>,
     /// Baseline for the average generation tokens/sec, reset per model switch.
     pub tps: Mutex<TpsTracker>,
+    /// Weighted speculative-decoding acceptance for the current model, derived
+    /// from completed-request timing lines in the captured server log.
+    pub spec_acceptance: Mutex<SpecAcceptanceTracker>,
     /// True while a benchmark run owns the server; blocks manual switching.
     pub benchmark_running: Mutex<bool>,
     /// Set to request cancellation of the in-progress benchmark run.
@@ -77,6 +80,19 @@ pub struct TpsTracker {
 }
 
 #[derive(Default)]
+pub struct SpecAcceptanceTracker {
+    /// Profile id these counters belong to; cleared when the model changes.
+    pub profile_id: Option<String>,
+    pub pid: Option<u32>,
+    /// Byte offset already consumed from the current run log.
+    pub log_offset: u64,
+    /// Cumulative raw counters. The displayed rate is accepted / generated,
+    /// which weights requests by their number of drafted tokens.
+    pub accepted_tokens: u64,
+    pub generated_tokens: u64,
+}
+
+#[derive(Default)]
 pub struct UsageTracker {
     pub profile_id: Option<String>,
     pub pid: Option<u32>,
@@ -104,6 +120,7 @@ impl AppState {
             usage_probe_disabled: Mutex::new(false),
             usage: Mutex::new(UsageTracker::default()),
             tps: Mutex::new(TpsTracker::default()),
+            spec_acceptance: Mutex::new(SpecAcceptanceTracker::default()),
             benchmark_running: Mutex::new(false),
             benchmark_cancel: Mutex::new(false),
             benchmark_generation: Mutex::new(0),
@@ -155,6 +172,9 @@ pub struct Status {
     /// Average generation tokens/sec for the running model since it started.
     /// `None` when unavailable (metrics not reachable, no requests yet).
     pub avg_tokens_per_second: Option<f64>,
+    /// Weighted speculative-decoding acceptance since this model was started.
+    /// Stored as a 0..=1 fraction; `None` until a speculative request completes.
+    pub avg_speculative_acceptance_rate: Option<f64>,
     /// Live GPU memory snapshot from NVIDIA's local tooling, when available.
     pub vram: VramStatus,
 }
@@ -201,6 +221,7 @@ impl AppState {
                 started_at: Some(rp.started_at.clone()),
                 usage_state: UsageState::Unknown,
                 avg_tokens_per_second: None,
+                avg_speculative_acceptance_rate: None,
                 vram: VramStatus::default(),
             },
             None => Status {
@@ -219,6 +240,7 @@ impl AppState {
                 started_at: None,
                 usage_state: UsageState::Unknown,
                 avg_tokens_per_second: None,
+                avg_speculative_acceptance_rate: None,
                 vram: VramStatus::default(),
             },
         }
