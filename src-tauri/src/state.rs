@@ -1,6 +1,7 @@
 //! Shared application state, guarded by std mutexes.
 
 use crate::script_scanner::{Profile, ScanResult};
+use crate::security::SecurityRuntime;
 use crate::settings::Settings;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -13,6 +14,9 @@ use std::sync::Mutex;
 /// is why stop logic kills the whole tree.
 pub struct RunningProcess {
     pub profile: Profile,
+    /// Exact credential resolved at launch. Kept only in memory so telemetry
+    /// probes use the same key that was injected into llama-server.
+    pub api_key: Option<String>,
     /// PID of the launched shell (cmd.exe / powershell.exe). Tree root.
     pub pid: u32,
     pub child: Child,
@@ -50,11 +54,16 @@ pub struct AppState {
     pub benchmark_running: Mutex<bool>,
     /// Set to request cancellation of the in-progress benchmark run.
     pub benchmark_cancel: Mutex<bool>,
+    /// Pause is cooperative: the active evaluation finishes, then the runner
+    /// waits before starting another model or prompt.
+    pub benchmark_paused: Mutex<bool>,
     /// Monotonically increasing run identity. Cancellation invalidates the
     /// active generation so late results cannot affect a newer run.
     pub benchmark_generation: Mutex<u64>,
     pub settings_path: PathBuf,
     pub logs_dir: PathBuf,
+    pub security: Mutex<SecurityRuntime>,
+    pub security_path: PathBuf,
 }
 
 /// Tracks average generation throughput for the currently running model, reset
@@ -108,7 +117,17 @@ pub enum UsageState {
 }
 
 impl AppState {
-    pub fn new(settings: Settings, scan: ScanResult, settings_path: PathBuf, logs_dir: PathBuf) -> Self {
+    pub fn new(
+        settings: Settings,
+        scan: ScanResult,
+        settings_path: PathBuf,
+        logs_dir: PathBuf,
+    ) -> Self {
+        let security_path = settings_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("security-bans.json");
+        let security = SecurityRuntime::load(&security_path);
         AppState {
             shutting_down: AtomicBool::new(false),
             settings: Mutex::new(settings),
@@ -123,9 +142,12 @@ impl AppState {
             spec_acceptance: Mutex::new(SpecAcceptanceTracker::default()),
             benchmark_running: Mutex::new(false),
             benchmark_cancel: Mutex::new(false),
+            benchmark_paused: Mutex::new(false),
             benchmark_generation: Mutex::new(0),
             settings_path,
             logs_dir,
+            security: Mutex::new(security),
+            security_path,
         }
     }
 

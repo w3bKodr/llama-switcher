@@ -31,9 +31,7 @@ fn is_size_token(token: &str) -> bool {
         return false;
     }
     let (digits, rest) = bytes.split_at(bytes.iter().take_while(|c| c.is_ascii_digit()).count());
-    !digits.is_empty()
-        && !rest.is_empty()
-        && rest.iter().all(|c| c.is_ascii_alphabetic())
+    !digits.is_empty() && !rest.is_empty() && rest.iter().all(|c| c.is_ascii_alphabetic())
 }
 
 /// Pretty-format a raw model name such as `qwen-27B` -> `Qwen-27B`.

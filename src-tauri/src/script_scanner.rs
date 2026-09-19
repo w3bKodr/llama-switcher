@@ -83,7 +83,11 @@ fn match_stem(stem: &str, parts: &PatternParts) -> Option<(String, String)> {
     if !parts.after.is_empty() {
         inner = inner.strip_suffix(&parts.after)?;
     }
-    let between = if parts.between.is_empty() { " - " } else { &parts.between };
+    let between = if parts.between.is_empty() {
+        " - "
+    } else {
+        &parts.between
+    };
     let sep = inner.find(between)?;
     let model = inner[..sep].trim().to_string();
     let feature = inner[sep + between.len()..].trim().to_string();
@@ -203,7 +207,11 @@ pub fn scan(settings: &Settings) -> ScanResult {
         a.pretty_model
             .to_lowercase()
             .cmp(&b.pretty_model.to_lowercase())
-            .then(a.pretty_feature.to_lowercase().cmp(&b.pretty_feature.to_lowercase()))
+            .then(
+                a.pretty_feature
+                    .to_lowercase()
+                    .cmp(&b.pretty_feature.to_lowercase()),
+            )
     });
 
     ScanResult {

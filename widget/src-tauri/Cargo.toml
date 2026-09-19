@@ -1,6 +1,6 @@
 [package]
 name = "llama-switcher-widget"
-version = "0.1.0"
+version = "0.1.1"
 description = "Desktop telemetry widget for Llama Switcher"
 authors = ["Llama Switcher"]
 edition = "2021"

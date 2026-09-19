@@ -4,6 +4,21 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum NetworkAccessMode {
+    LocalOnly,
+    CloudflareTunnel,
+    DirectInternet,
+    WhitelistOnly,
+}
+
+impl Default for NetworkAccessMode {
+    fn default() -> Self {
+        Self::CloudflareTunnel
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DefaultProfileMode {
@@ -28,6 +43,24 @@ pub struct Settings {
     /// default is intentionally secure, including for older settings files.
     #[serde(default = "default_require_server_api_key")]
     pub require_server_api_key: bool,
+    /// Optional security gateway placed in front of llama-server. Cloudflare
+    /// should target this port while llama-server remains on `server_port`.
+    #[serde(default)]
+    pub security_gateway_enabled: bool,
+    #[serde(default = "default_security_gateway_port")]
+    pub security_gateway_port: u16,
+    #[serde(default)]
+    pub network_access_mode: NetworkAccessMode,
+    #[serde(default)]
+    pub trusted_networks: Vec<String>,
+    #[serde(default = "default_true")]
+    pub auto_ban_enabled: bool,
+    #[serde(default = "default_auto_ban_threshold")]
+    pub auto_ban_failure_threshold: u32,
+    #[serde(default = "default_auto_ban_window_seconds")]
+    pub auto_ban_window_seconds: u64,
+    #[serde(default = "default_auto_ban_duration_seconds")]
+    pub auto_ban_duration_seconds: u64,
     pub agent_api_port: u16,
     pub agent_api_token: String,
     pub auto_rescan_on_startup: bool,
@@ -58,6 +91,22 @@ fn default_require_server_api_key() -> bool {
     true
 }
 
+fn default_true() -> bool {
+    true
+}
+fn default_security_gateway_port() -> u16 {
+    1235
+}
+fn default_auto_ban_threshold() -> u32 {
+    8
+}
+fn default_auto_ban_window_seconds() -> u64 {
+    60
+}
+fn default_auto_ban_duration_seconds() -> u64 {
+    900
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -68,6 +117,14 @@ impl Default for Settings {
             health_url: "http://127.0.0.1:1234/health".to_string(),
             llama_server_api_key: None,
             require_server_api_key: true,
+            security_gateway_enabled: false,
+            security_gateway_port: default_security_gateway_port(),
+            network_access_mode: NetworkAccessMode::CloudflareTunnel,
+            trusted_networks: Vec::new(),
+            auto_ban_enabled: true,
+            auto_ban_failure_threshold: default_auto_ban_threshold(),
+            auto_ban_window_seconds: default_auto_ban_window_seconds(),
+            auto_ban_duration_seconds: default_auto_ban_duration_seconds(),
             agent_api_port: 47891,
             agent_api_token: generate_token(),
             auto_rescan_on_startup: true,
@@ -122,12 +179,13 @@ mod tests {
     #[test]
     fn api_key_launch_protection_defaults_on_for_older_settings_files() {
         let mut value = serde_json::to_value(Settings::default()).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("requireServerApiKey");
+        value.as_object_mut().unwrap().remove("requireServerApiKey");
 
         let loaded: Settings = serde_json::from_value(value).unwrap();
         assert!(loaded.require_server_api_key);
     }
+}
+#[test]
+fn security_gateway_defaults_off_for_new_installations() {
+    assert!(!Settings::default().security_gateway_enabled);
 }

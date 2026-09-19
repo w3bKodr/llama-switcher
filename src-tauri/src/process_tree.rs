@@ -13,9 +13,7 @@ mod imp {
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
-    use windows::Win32::System::Threading::{
-        OpenProcess, TerminateProcess, PROCESS_TERMINATE,
-    };
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
     /// pid -> parent pid for every running process.
     fn snapshot() -> HashMap<u32, u32> {
@@ -164,7 +162,7 @@ mod imp {
         let map = snapshot();
         let ppid = *map.get(&pid)?;
         if ppid == 0 {
-            None  // system root (no parent)
+            None // system root (no parent)
         } else {
             Some(ppid)
         }

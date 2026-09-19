@@ -3,11 +3,13 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentApiInfo,
   BenchmarkConfig,
+  ProfessionalBenchmarkSummary,
   LogEntry,
   LogUpdate,
   Profile,
   ScanResult,
   Settings,
+  SecurityBan,
   Status,
   WidgetInstallStatus,
 } from "./types";
@@ -18,6 +20,9 @@ export const api = {
   getSettings: () => invoke<Settings>("get_settings"),
   saveSettings: (settings: Settings) =>
     invoke<Settings>("save_settings", { settings }),
+  listSecurityBans: () => invoke<SecurityBan[]>("list_security_bans"),
+  unbanSecurityIp: (ip: string) => invoke<void>("unban_security_ip", { ip }),
+  banSecurityIp: (ip: string) => invoke<void>("ban_security_ip", { ip }),
   rescanScripts: () => invoke<ScanResult>("rescan_scripts"),
   getDetectedProfiles: () => invoke<Profile[]>("get_detected_profiles"),
   getScanResult: () => invoke<ScanResult>("get_scan_result"),
@@ -61,12 +66,20 @@ export const api = {
     invoke<WidgetInstallStatus>("install_widget", { startWithWindows }),
 
   getBenchmarkConfig: () => invoke<BenchmarkConfig>("get_benchmark_config"),
+  getProfessionalBenchmarkCatalog: () =>
+    invoke<ProfessionalBenchmarkSummary[]>("get_professional_benchmark_catalog"),
+  getBenchmarkResumeCount: (config: BenchmarkConfig) =>
+    invoke<number>("get_benchmark_resume_count", { config }),
   saveBenchmarkConfig: (config: BenchmarkConfig) =>
     invoke<void>("save_benchmark_config", { config }),
-  runBenchmark: (config: BenchmarkConfig) =>
-    invoke<void>("run_benchmark", { config }),
+  runBenchmark: (config: BenchmarkConfig, startFresh = false) =>
+    invoke<void>("run_benchmark", { config, startFresh }),
   cancelBenchmark: () => invoke<void>("cancel_benchmark"),
+  pauseBenchmark: () => invoke<void>("pause_benchmark"),
+  resumeBenchmark: () => invoke<void>("resume_benchmark"),
   isBenchmarkRunning: () => invoke<boolean>("is_benchmark_running"),
 
   openPath: (path: string) => invoke<void>("open_path", { path }),
+  openBenchmarkReport: (path: string) =>
+    invoke<void>("open_benchmark_report", { path }),
 };

@@ -55,8 +55,11 @@ pub fn build_menu(app: &AppHandle, status: Option<&Status>) -> tauri::Result<Men
             let mut model_sub = SubmenuBuilder::new(app, model);
             for profile in profiles.iter().filter(|p| &p.pretty_model == model) {
                 model_sub = model_sub.item(
-                    &MenuItemBuilder::with_id(format!("profile::{}", profile.id), &profile.pretty_feature)
-                        .build(app)?,
+                    &MenuItemBuilder::with_id(
+                        format!("profile::{}", profile.id),
+                        &profile.pretty_feature,
+                    )
+                    .build(app)?,
                 );
             }
             profile_sub = profile_sub.item(&model_sub.build()?);
@@ -90,14 +93,18 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, event| handle_menu_event(app, event.id.as_ref()))
-        .on_tray_icon_event(|tray, event| {
-            match event {
-                TrayIconEvent::Click { button: MouseButton::Left, .. }
-                | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => {
-                    crate::show_dashboard(tray.app_handle(), None);
-                }
-                _ => {}
+        .on_tray_icon_event(|tray, event| match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                ..
             }
+            | TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => {
+                crate::show_dashboard(tray.app_handle(), None);
+            }
+            _ => {}
         })
         .build(app)?;
     Ok(())
@@ -166,7 +173,10 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             crate::open_folder(&folder);
         }
         "open_logs" => {
-            let dir = crate::get_state(&app).logs_dir.to_string_lossy().to_string();
+            let dir = crate::get_state(&app)
+                .logs_dir
+                .to_string_lossy()
+                .to_string();
             crate::open_folder(&dir);
         }
         "quit" => crate::quit_app(&app),
@@ -184,7 +194,8 @@ where
             let _ = tauri::Emitter::emit(
                 &app,
                 "warning",
-                "A benchmark is running; server controls are disabled until it finishes.".to_string(),
+                "A benchmark is running; server controls are disabled until it finishes."
+                    .to_string(),
             );
             return;
         }

@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../api";
-import type { BenchmarkPrompt, BenchmarkProgress, Profile } from "../types";
+import type {
+  BenchmarkPrompt,
+  BenchmarkProgress,
+  BenchmarkConfig,
+  ProfessionalBenchmarkSummary,
+  Profile,
+} from "../types";
 
 // Mirror of the Rust `sanitize_alias`: whitespace and illegal chars -> '-',
 // collapse repeats. Used only to build the "Open folder" path for each model.
@@ -13,6 +19,13 @@ function sanitizeAlias(alias: string): string {
     .split("-")
     .filter((p) => p.length > 0)
     .join("-");
+}
+
+function scoreTone(score: number): string {
+  if (score < 40) return "score-bad";
+  if (score < 60) return "score-warning";
+  if (score < 90) return "score-caution";
+  return "score-good";
 }
 
 type CellState = "pending" | "running" | "done" | "error";
@@ -50,20 +63,31 @@ export function BenchmarkPage({
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [prompts, setPrompts] = useState<BenchmarkPrompt[]>([]);
+  const [professionalCases, setProfessionalCases] = useState<ProfessionalBenchmarkSummary[]>([]);
+  const [selectedProfessionalIds, setSelectedProfessionalIds] = useState<string[]>([]);
   const [outputDir, setOutputDir] = useState("");
-  const [timeoutSeconds, setTimeoutSeconds] = useState(600);
+  const [timeoutSeconds, setTimeoutSeconds] = useState(300);
   const [modelStartTimeoutSeconds, setModelStartTimeoutSeconds] = useState(300);
+  const [gradingTimeoutSeconds, setGradingTimeoutSeconds] = useState(30);
   const [runsPerPrompt, setRunsPerPrompt] = useState(1);
+  const [generateHtmlReport, setGenerateHtmlReport] = useState(true);
+  const [openReportWhenComplete, setOpenReportWhenComplete] = useState(false);
+  const [resumeCompletedRuns, setResumeCompletedRuns] = useState(true);
+  const [resumeCount, setResumeCount] = useState(0);
   const [modelFilter, setModelFilter] = useState("");
   const [activePromptId, setActivePromptId] = useState<string | null>(null);
 
   const [running, setRunning] = useState(false);
+  const [pauseState, setPauseState] = useState<"running" | "pausing" | "paused">("running");
   const [cells, setCells] = useState<Record<string, CellState>>({});
   const [durations, setDurations] = useState<Record<string, number>>({});
   const [tps, setTps] = useState<Record<string, number>>({});
   const [repetitionProgress, setRepetitionProgress] = useState<Record<string, RepetitionProgress>>({});
   const [completedRuns, setCompletedRuns] = useState<Record<string, true>>({});
   const [acceptanceTotals, setAcceptanceTotals] = useState<Record<string, AcceptanceTotal>>({});
+  const [scores, setScores] = useState<Record<string, number>>({});
+  const [gradeCounts, setGradeCounts] = useState<Record<string, { passed: number; total: number }>>({});
+  const [reportPath, setReportPath] = useState<string | null>(null);
   const [modelStates, setModelStates] = useState<Record<string, ModelState>>({});
   const [errors, setErrors] = useState<string[]>([]);
   const promptSeq = useRef(3);
@@ -72,18 +96,29 @@ export function BenchmarkPage({
   useEffect(() => {
     (async () => {
       try {
-        const [cfg, profs, isRunning] = await Promise.all([
+        const [cfg, catalog, profs, isRunning] = await Promise.all([
           api.getBenchmarkConfig(),
+          api.getProfessionalBenchmarkCatalog(),
           api.getDetectedProfiles(),
           api.isBenchmarkRunning(),
         ]);
         setProfiles(profs);
+        setProfessionalCases(catalog);
         setPrompts(cfg.prompts);
         setActivePromptId(cfg.prompts[0]?.id ?? null);
+        setSelectedProfessionalIds(
+          cfg.professionalCaseIds
+            ? cfg.professionalCaseIds.filter((id) => catalog.some((item) => item.id === id))
+            : catalog.map((item) => item.id),
+        );
         setOutputDir(cfg.outputDir);
         setTimeoutSeconds(cfg.timeoutSeconds);
         setModelStartTimeoutSeconds(cfg.modelStartTimeoutSeconds ?? 300);
+        setGradingTimeoutSeconds(cfg.gradingTimeoutSeconds ?? 30);
         setRunsPerPrompt(cfg.runsPerPrompt ?? 1);
+        setGenerateHtmlReport(cfg.generateHtmlReport !== false);
+        setOpenReportWhenComplete(cfg.openReportWhenComplete === true);
+        setResumeCompletedRuns(cfg.resumeCompletedRuns !== false);
         setRunning(isRunning);
         const valid = cfg.profileIds.filter((id) => profs.some((p) => p.id === id));
         setSelectedIds(valid.length > 0 ? valid : profs.slice(0, 2).map((p) => p.id));
@@ -109,16 +144,33 @@ export function BenchmarkPage({
       if (p.kind === "run") {
         if (p.status === "running") {
           setRunning(true);
+          setPauseState("running");
           setCells({});
           setDurations({});
           setTps({});
           setRepetitionProgress({});
           setCompletedRuns({});
           setAcceptanceTotals({});
+          setScores({});
+          setGradeCounts({});
+          setReportPath(null);
           setModelStates({});
           setErrors([]);
+        } else if (p.status === "pausing") {
+          setPauseState("pausing");
+        } else if (p.status === "paused") {
+          setPauseState("paused");
+        } else if (p.status === "resumed") {
+          setPauseState("running");
         } else if (p.status === "finished" || p.status === "cancelled") {
           setRunning(false);
+          setPauseState("running");
+          if (p.reportPath) {
+            setReportPath(p.reportPath);
+            if (openReportWhenComplete) {
+              void api.openBenchmarkReport(p.reportPath);
+            }
+          }
           showToast(`Benchmark ${p.status}.`);
         }
       } else if (p.kind === "model" && p.profileId) {
@@ -164,6 +216,15 @@ export function BenchmarkPage({
             [key]: { drafted: p.draftTokens!, accepted: p.acceptedDraftTokens! },
           }));
         }
+        if (p.score != null) {
+          setScores((items) => ({ ...items, [key]: p.score! }));
+        }
+        if (p.passedTests != null && p.totalTests != null) {
+          setGradeCounts((items) => ({
+            ...items,
+            [key]: { passed: p.passedTests!, total: p.totalTests! },
+          }));
+        }
       }
     });
     return () => {
@@ -182,6 +243,27 @@ export function BenchmarkPage({
     () => prompts.filter((prompt) => prompt.enabled !== false),
     [prompts],
   );
+  const enabledProfessionalCases = useMemo(
+    () => professionalCases.filter((item) => selectedProfessionalIds.includes(item.id)),
+    [professionalCases, selectedProfessionalIds],
+  );
+  const benchmarkItems = useMemo(
+    () => [
+      ...enabledPrompts.map((prompt) => ({
+        id: prompt.id,
+        title: prompt.title,
+        kind: "custom" as const,
+        difficulty: null as string | null,
+      })),
+      ...enabledProfessionalCases.map((item) => ({
+        id: item.id,
+        title: item.title,
+        kind: "professional" as const,
+        difficulty: item.difficulty,
+      })),
+    ],
+    [enabledPrompts, enabledProfessionalCases],
+  );
   const visibleProfiles = useMemo(() => {
     const filter = modelFilter.trim().toLowerCase();
     if (!filter) return profiles;
@@ -198,13 +280,13 @@ export function BenchmarkPage({
     }, []),
     [visibleProfiles],
   );
-  const totalJobs = selectedProfiles.length * enabledPrompts.length * runsPerPrompt;
+  const totalJobs = selectedProfiles.length * benchmarkItems.length * runsPerPrompt;
   const finishedJobs = Object.keys(completedRuns).length;
   const progressPercent = totalJobs > 0 ? Math.min(100, (finishedJobs / totalJobs) * 100) : 0;
   const acceptanceByModel = useMemo(() => {
     return selectedProfiles.reduce<Record<string, AcceptanceTotal>>((models, profile) => {
-      const totals = enabledPrompts.reduce<AcceptanceTotal>((sum, prompt) => {
-        const item = acceptanceTotals[cellKey(profile.id, prompt.id)];
+      const totals = benchmarkItems.reduce<AcceptanceTotal>((sum, benchmark) => {
+        const item = acceptanceTotals[cellKey(profile.id, benchmark.id)];
         return item
           ? { drafted: sum.drafted + item.drafted, accepted: sum.accepted + item.accepted }
           : sum;
@@ -212,7 +294,34 @@ export function BenchmarkPage({
       models[profile.id] = totals;
       return models;
     }, {});
-  }, [acceptanceTotals, enabledPrompts, selectedProfiles]);
+  }, [acceptanceTotals, benchmarkItems, selectedProfiles]);
+
+  const currentConfig = useMemo<BenchmarkConfig>(() => ({
+    profileIds: selectedIds,
+    prompts,
+    professionalCaseIds: selectedProfessionalIds,
+    outputDir,
+    timeoutSeconds,
+    modelStartTimeoutSeconds,
+    gradingTimeoutSeconds,
+    runsPerPrompt,
+    generateHtmlReport,
+    openReportWhenComplete,
+    resumeCompletedRuns,
+  }), [selectedIds, prompts, selectedProfessionalIds, outputDir, timeoutSeconds,
+    modelStartTimeoutSeconds, gradingTimeoutSeconds, runsPerPrompt,
+    generateHtmlReport, openReportWhenComplete, resumeCompletedRuns]);
+
+  useEffect(() => {
+    if (running || !resumeCompletedRuns || !outputDir.trim()) {
+      setResumeCount(0);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      api.getBenchmarkResumeCount(currentConfig).then(setResumeCount).catch(() => setResumeCount(0));
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [currentConfig, outputDir, resumeCompletedRuns, running]);
 
   function toggleModel(id: string) {
     setSelectedIds((ids) =>
@@ -252,20 +361,13 @@ export function BenchmarkPage({
     }
   }
 
-  async function run() {
+  async function run(startFresh = false) {
     if (selectedIds.length === 0) return showToast("Select at least one model.", true);
-    if (enabledPrompts.length === 0) return showToast("Select at least one prompt.", true);
+    if (benchmarkItems.length === 0) return showToast("Select at least one custom or professional benchmark.", true);
     if (!outputDir.trim()) return showToast("Choose an output folder.", true);
     try {
-      await api.runBenchmark({
-        profileIds: selectedIds,
-        prompts,
-        outputDir,
-        timeoutSeconds,
-        modelStartTimeoutSeconds,
-        runsPerPrompt,
-      });
-      showToast("Benchmark started.");
+      await api.runBenchmark(currentConfig, startFresh);
+      showToast(startFresh ? "New benchmark started." : "Benchmark resumed.");
     } catch (e) {
       showToast(`Could not start: ${String(e)}`, true);
     }
@@ -281,6 +383,18 @@ export function BenchmarkPage({
     }
   }
 
+  async function togglePause() {
+    try {
+      if (pauseState === "paused") {
+        await api.resumeBenchmark();
+      } else {
+        await api.pauseBenchmark();
+      }
+    } catch (e) {
+      showToast(String(e), true);
+    }
+  }
+
   return (
     <div className="benchmark-page">
       <section className={`benchmark-hero ${running ? "is-running" : ""}`}>
@@ -291,17 +405,27 @@ export function BenchmarkPage({
         </div>
         <div className="benchmark-run-summary">
           <div><b>{selectedIds.length}</b><span>Models</span></div>
-          <div><b>{enabledPrompts.length}</b><span>Prompts</span></div>
+          <div><b>{benchmarkItems.length}</b><span>Benchmarks</span></div>
           <div><b>{totalJobs}</b><span>Total runs</span></div>
           <div><b>{runsPerPrompt}×</b><span>Each prompt</span></div>
         </div>
         <div className="benchmark-primary-action">
           {running ? (
-            <button className="btn danger benchmark-run-button" onClick={() => void cancel()}><span>■</span> Cancel run</button>
+            <div className="benchmark-run-controls">
+              <button className="btn benchmark-run-button" disabled={pauseState === "pausing"} onClick={() => void togglePause()}>
+                <span>{pauseState === "paused" ? "▶" : "Ⅱ"}</span> {pauseState === "paused" ? "Resume" : pauseState === "pausing" ? "Pausing…" : "Pause"}
+              </button>
+              <button className="btn danger benchmark-run-button" onClick={() => void cancel()}><span>■</span> Cancel</button>
+            </div>
+          ) : resumeCount > 0 ? (
+            <div className="benchmark-start-options">
+              <button className="btn primary benchmark-run-button" onClick={() => void run(false)}><span>▶</span> Resume benchmark</button>
+              <button className="btn benchmark-new-button" onClick={() => void run(true)}>Start new benchmark</button>
+            </div>
           ) : (
-            <button className="btn primary benchmark-run-button" onClick={() => void run()}><span>▶</span> Run benchmark</button>
+            <button className="btn primary benchmark-run-button" onClick={() => void run(true)}><span>▶</span> Run benchmark</button>
           )}
-          <small>{running ? `${finishedJobs} of ${totalJobs} completed` : `${totalJobs} queued evaluations`}</small>
+          <small>{running ? pauseState === "paused" ? `Paused · ${finishedJobs} of ${totalJobs} completed` : pauseState === "pausing" ? "Pausing after the active evaluation…" : `${finishedJobs} of ${totalJobs} completed` : resumeCount > 0 ? `${resumeCount} verified saved · ${totalJobs - resumeCount} remaining` : `${totalJobs} queued evaluations`}</small>
         </div>
       </section>
 
@@ -354,16 +478,52 @@ export function BenchmarkPage({
         <div className="benchmark-panel-heading">
           <div>
             <span className="benchmark-step">02</span>
-            <div><h2>Choose prompt set</h2><p>Check the prompts to run; skipped prompts stay saved for later.</p></div>
+            <div><h2>Choose benchmarks</h2><p>Use deterministic professional cases, custom performance prompts, or both.</p></div>
           </div>
           <div className="benchmark-heading-actions">
-            <span className="benchmark-selection-count">{enabledPrompts.length} of {prompts.length} selected</span>
-            <button className="text-button" disabled={running || enabledPrompts.length === prompts.length} onClick={() => setPrompts((items) => items.map((prompt) => ({ ...prompt, enabled: true })))}>Select all</button>
-            <button className="text-button" disabled={running || enabledPrompts.length === 0} onClick={() => setPrompts((items) => items.map((prompt) => ({ ...prompt, enabled: false })))}>Clear</button>
-            <button className="btn small" onClick={addPrompt} disabled={running}>+ Add prompt</button>
+            <span className="benchmark-selection-count">{benchmarkItems.length} selected</span>
+            <button className="text-button" disabled={running || enabledPrompts.length === prompts.length} onClick={() => setPrompts((items) => items.map((prompt) => ({ ...prompt, enabled: true })))}>Select custom tests</button>
+            <button className="text-button" disabled={running || enabledPrompts.length === 0} onClick={() => setPrompts((items) => items.map((prompt) => ({ ...prompt, enabled: false })))}>Clear custom tests</button>
+            <button className="btn small" onClick={addPrompt} disabled={running}>+ Add custom test</button>
           </div>
         </div>
-        <div className="benchmark-prompts">
+        <details className="benchmark-subsection benchmark-expander" open>
+          <summary className="benchmark-subsection-heading">
+            <div><strong>Professional tests</strong><small>18 current-generation coding tasks with hidden tests. Suite v{professionalCases[0]?.suiteVersion ?? 2}.</small></div>
+            <span>{selectedProfessionalIds.length} of {professionalCases.length} selected</span>
+          </summary>
+          <div className="benchmark-prompts">
+            {professionalCases.map((item, i) => {
+              const selected = selectedProfessionalIds.includes(item.id);
+              const expanded = activePromptId === item.id;
+              return <article key={item.id} className={"bench-prompt professional-prompt " + (selected ? "selected" : "excluded") + (expanded ? " expanded" : "")}>
+                <div className="bench-prompt-header">
+                  <label className="bench-prompt-select" title={selected ? "Included in this run" : "Skipped in this run"}>
+                    <input type="checkbox" checked={selected} onChange={(event) => setSelectedProfessionalIds((ids) => event.target.checked ? [...ids, item.id] : ids.filter((id) => id !== item.id))} disabled={running} aria-label={(selected ? "Exclude " : "Include ") + item.title} />
+                    <span>{selected ? "✓" : ""}</span>
+                  </label>
+                  <button className="bench-prompt-toggle" type="button" onClick={() => setActivePromptId(expanded ? null : item.id)}>
+                    <span>{String(i + 1).padStart(2, "0")}</span>
+                    <span><b>{item.title}</b><small>{item.difficulty.toUpperCase()} · {item.totalTestCount} deterministic tests · {selected ? "Included" : "Skipped"}</small></span>
+                    <i>{expanded ? "−" : "+"}</i>
+                  </button>
+                  <span className={"benchmark-difficulty " + item.difficulty}>{item.difficulty}</span>
+                </div>
+                {expanded && <div className="bench-prompt-editor professional-preview">
+                  <p>{item.description}</p>
+                  <code>{item.functionSignature}</code>
+                  <pre>{item.prompt}</pre>
+                </div>}
+              </article>;
+            })}
+          </div>
+        </details>
+        <details className="benchmark-subsection benchmark-expander">
+          <summary className="benchmark-subsection-heading">
+            <div><strong>Custom tests</strong><small>Editable generation and performance tests; correctness is not graded.</small></div>
+            <span>{enabledPrompts.length} of {prompts.length} selected</span>
+          </summary>
+          <div className="benchmark-prompts">
           {prompts.map((p, i) => {
             const expanded = activePromptId === p.id;
             const enabled = p.enabled !== false;
@@ -387,6 +547,7 @@ export function BenchmarkPage({
             </article>;
           })}
         </div>
+        </details>
       </section>
 
       {/* Output + timeout */}
@@ -411,18 +572,26 @@ export function BenchmarkPage({
             <div><input type="number" min={1} max={100} step={1} value={runsPerPrompt} onChange={(event) => setRunsPerPrompt(Math.max(1, Math.min(100, Math.trunc(Number(event.target.value) || 1))))} disabled={running} /><b>times</b></div>
           </label>
           <label className="benchmark-timeout">
-            <span>Per-prompt timeout</span>
-            <div><input type="number" min={1} value={timeoutSeconds} onChange={(event) => setTimeoutSeconds(Number(event.target.value))} disabled={running} /><b>seconds</b></div>
+            <span>Per-test generation timeout</span>
+            <div><input type="number" min={1} value={timeoutSeconds} onChange={(event) => setTimeoutSeconds(Math.max(1, Number(event.target.value) || 300))} disabled={running} /><b>seconds</b></div>
           </label>
           <label className="benchmark-timeout">
             <span>Model startup timeout</span>
             <div><input type="number" min={1} value={modelStartTimeoutSeconds} onChange={(event) => setModelStartTimeoutSeconds(Number(event.target.value))} disabled={running} /><b>seconds</b></div>
           </label>
+          <label className="benchmark-timeout">
+            <span>Grading limit</span>
+            <div><input type="number" min={1} max={300} value={gradingTimeoutSeconds} onChange={(event) => setGradingTimeoutSeconds(Math.max(1, Math.min(300, Number(event.target.value) || 30)))} disabled={running} /><b>seconds</b></div>
+          </label>
+          <label className="benchmark-report-option"><span>Report</span><span><input type="checkbox" checked={generateHtmlReport} onChange={(event) => setGenerateHtmlReport(event.target.checked)} disabled={running} /> Generate offline HTML charts</span></label>
+          <label className="benchmark-report-option"><span>After completion</span><span><input type="checkbox" checked={openReportWhenComplete} onChange={(event) => setOpenReportWhenComplete(event.target.checked)} disabled={running || !generateHtmlReport} /> Open report automatically</span></label>
+          <label className="benchmark-report-option"><span>Crash recovery</span><span><input type="checkbox" checked={resumeCompletedRuns} onChange={(event) => setResumeCompletedRuns(event.target.checked)} disabled={running} /> Resume verified completed runs</span><small>After a crash, start the same benchmark with the same results folder. Finished iterations are skipped; incomplete or changed prompts run again.</small></label>
         </div>
+        {reportPath && !running && <div className="benchmark-report-link"><span>Report ready</span><button className="btn small" onClick={() => void api.openBenchmarkReport(reportPath)}>Open benchmark-report.html</button><code>{reportPath}</code></div>}
       </section>
 
       {/* Progress grid */}
-      {selectedProfiles.length > 0 && enabledPrompts.length > 0 && (
+      {selectedProfiles.length > 0 && benchmarkItems.length > 0 && (
         <section className="benchmark-panel benchmark-progress-panel">
           <div className="benchmark-progress-heading">
             <div><span className={`run-indicator ${running ? "active" : ""}`} /><div><h2>{running ? "Benchmark in progress" : "Run preview"}</h2><p>{finishedJobs} of {totalJobs} evaluations complete</p></div></div>
@@ -434,9 +603,9 @@ export function BenchmarkPage({
               <thead>
                 <tr>
                   <th>Model</th>
-                  {enabledPrompts.map((p) => (
+                  {benchmarkItems.map((p, index) => (
                     <th key={p.id} title={p.title}>
-                      #{prompts.findIndex((prompt) => prompt.id === p.id) + 1}
+                      #{index + 1} {p.kind === "professional" ? <small className="benchmark-grid-difficulty">{p.difficulty}</small> : null}
                     </th>
                   ))}
                   <th title="Accepted speculative draft tokens divided by all drafted tokens for this model">Weighted spec acceptance</th>
@@ -447,8 +616,8 @@ export function BenchmarkPage({
                 {selectedProfiles.map((prof) => {
                   const ms = modelStates[prof.id] ?? "pending";
                   const modelAcceptance = acceptanceByModel[prof.id];
-                  const modelComplete = enabledPrompts.every((prompt) => {
-                    const state = cells[cellKey(prof.id, prompt.id)];
+                   const modelComplete = benchmarkItems.every((benchmark) => {
+                     const state = cells[cellKey(prof.id, benchmark.id)];
                     return state === "done" || state === "error";
                   });
                   return (
@@ -458,16 +627,20 @@ export function BenchmarkPage({
                         {ms === "switching" && <span className="badge yellow">switching…</span>}
                         {ms === "error" && <span className="badge red">error</span>}
                       </td>
-                      {enabledPrompts.map((p) => {
+                      {benchmarkItems.map((p) => {
                         const key = cellKey(prof.id, p.id);
                         const cs = cells[key] ?? "pending";
                         const dur = durations[key];
                         const speed = tps[key];
                         const repeat = repetitionProgress[key];
+                        const score = scores[key];
+                        const count = gradeCounts[key];
                         return (
                           <td key={p.id} className={`bench-cell ${cs}`} title={cs}>
                             {cs === "done" ? (
                               <div className="bench-cell-done">
+                                {score != null && <b className={`bench-grade-score ${scoreTone(score)}`}>{score.toFixed(0)}%</b>}
+                                {count && <small className="bench-grade-count">{count.passed}/{count.total} tests</small>}
                                 <span>{dur != null ? `avg ${formatHMS(dur)}` : "✓"}</span>
                                 {speed != null && (
                                   <span className="bench-tps">{speed.toFixed(1)} avg tk/s</span>

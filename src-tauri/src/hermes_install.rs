@@ -52,10 +52,15 @@ pub fn candidate_dirs() -> Vec<PathBuf> {
 }
 
 fn normalize_skills_dir(selected: &Path) -> PathBuf {
-    if selected.file_name().is_some_and(|name| name.eq_ignore_ascii_case("skills")) {
+    if selected
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("skills"))
+    {
         selected.to_path_buf()
     } else if selected.join("config.yaml").exists()
-        || selected.file_name().is_some_and(|name| name.eq_ignore_ascii_case(".hermes"))
+        || selected
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case(".hermes"))
     {
         selected.join("skills")
     } else {
@@ -138,7 +143,10 @@ pub fn install(
     }
 
     let hermes_home = skills_dir.parent().ok_or_else(|| {
-        format!("Cannot determine Hermes home from {}.", skills_dir.display())
+        format!(
+            "Cannot determine Hermes home from {}.",
+            skills_dir.display()
+        )
     })?;
     let env_path = hermes_home.join(".env");
     let mut env_contents = std::fs::read_to_string(&env_path).unwrap_or_default();
@@ -156,10 +164,8 @@ mod tests {
 
     #[test]
     fn installs_native_skill_and_updates_profile_env() {
-        let root = std::env::temp_dir().join(format!(
-            "llama-switcher-hermes-test-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("llama-switcher-hermes-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let source = root.join("source");
         let home = root.join(".hermes");
@@ -167,7 +173,11 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(source.join("SKILL.md"), "---\nname: llama-switcher\n---\n").unwrap();
         std::fs::write(source.join("scripts/client.py"), "print('ok')\n").unwrap();
-        std::fs::write(home.join(".env"), "EXISTING=value\nLLAMA_SWITCHER_API_TOKEN=old\n").unwrap();
+        std::fs::write(
+            home.join(".env"),
+            "EXISTING=value\nLLAMA_SWITCHER_API_TOKEN=old\n",
+        )
+        .unwrap();
 
         let dest = install(&source, &home, "http://127.0.0.1:1234", "new-token").unwrap();
 

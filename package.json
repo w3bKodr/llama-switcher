@@ -1,6 +1,6 @@
 {
   "name": "llama-switcher",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Lightweight Windows tray app to detect and switch between llama.cpp server startup scripts.",
   "type": "module",
   "private": true,

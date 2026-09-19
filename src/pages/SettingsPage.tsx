@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
-import type { DefaultProfileMode, Profile, Settings, WidgetInstallStatus } from "../types";
+import type { DefaultProfileMode, NetworkAccessMode, Profile, SecurityBan, Settings, WidgetInstallStatus } from "../types";
 
 const ALL_EXTENSIONS = [".cmd", ".bat", ".ps1"];
 
@@ -17,12 +17,19 @@ export function SettingsPage({
   const [widgetStatus, setWidgetStatus] = useState<WidgetInstallStatus | null>(null);
   const [widgetInstalling, setWidgetInstalling] = useState(false);
   const [widgetPromptOpen, setWidgetPromptOpen] = useState(false);
+  const [securityBans, setSecurityBans] = useState<SecurityBan[]>([]);
+  const [manualBanIp, setManualBanIp] = useState("");
+  const settingsRef = useRef<Settings | null>(null);
+  const securitySaveTimer = useRef<number | null>(null);
+  const securityDirty = useRef(false);
 
   useEffect(() => {
     (async () => {
       try {
         const loadedSettings = await api.getSettings();
         setSettings(loadedSettings);
+        settingsRef.current = loadedSettings;
+        void api.listSecurityBans().then(setSecurityBans).catch(console.warn);
 
         // Profile choices enhance one field but should never hold up the
         // entire settings screen.
@@ -54,10 +61,44 @@ export function SettingsPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => () => {
+    if (securitySaveTimer.current !== null) window.clearTimeout(securitySaveTimer.current);
+    if (securityDirty.current && settingsRef.current) {
+      void api.saveSettings(settingsRef.current).catch((error) =>
+        console.warn("Could not persist network security settings", error)
+      );
+    }
+  }, []);
+
   if (!settings) return <div>Loading…</div>;
 
   function update<K extends keyof Settings>(key: K, value: Settings[K]) {
-    setSettings((s) => (s ? { ...s, [key]: value } : s));
+    setSettings((s) => {
+      const next = s ? { ...s, [key]: value } : s;
+      settingsRef.current = next;
+      return next;
+    });
+  }
+
+  function updateSecurity<K extends keyof Settings>(key: K, value: Settings[K]) {
+    const current = settingsRef.current;
+    if (!current) return;
+    const next = { ...current, [key]: value };
+    settingsRef.current = next;
+    setSettings(next);
+    securityDirty.current = true;
+    if (securitySaveTimer.current !== null) window.clearTimeout(securitySaveTimer.current);
+    securitySaveTimer.current = window.setTimeout(() => {
+      const latest = settingsRef.current;
+      if (!latest) return;
+      void api.saveSettings(latest)
+        .then((saved) => {
+          settingsRef.current = saved;
+          setSettings(saved);
+          securityDirty.current = false;
+        })
+        .catch((error) => console.warn("Could not persist network security settings", error));
+    }, 400);
   }
 
   // Changing the server port keeps the health URL's port in sync, so the live
@@ -88,6 +129,8 @@ export function SettingsPage({
     try {
       const saved = await api.saveSettings(settings!);
       setSettings(saved);
+      settingsRef.current = saved;
+      securityDirty.current = false;
       showToast("Settings saved.");
     } catch (e) {
       showToast(`Save failed: ${String(e)}`, true);
@@ -113,6 +156,25 @@ export function SettingsPage({
     } catch (e) {
       showToast(`Token regeneration failed: ${String(e)}`, true);
     }
+  }
+
+  async function refreshBans() {
+    try { setSecurityBans(await api.listSecurityBans()); }
+    catch (e) { showToast(`Could not load ban list: ${String(e)}`, true); }
+  }
+
+  async function unban(ip: string) {
+    try { await api.unbanSecurityIp(ip); await refreshBans(); showToast(`${ip} was unbanned.`); }
+    catch (e) { showToast(`Unban failed: ${String(e)}`, true); }
+  }
+
+  async function manualBan() {
+    try {
+      await api.banSecurityIp(manualBanIp.trim());
+      setManualBanIp("");
+      await refreshBans();
+      showToast("Address banned.");
+    } catch (e) { showToast(`Ban failed: ${String(e)}`, true); }
   }
 
   async function toggleMainAutostart(enabled: boolean) {
@@ -357,6 +419,80 @@ export function SettingsPage({
             </button>
           </div>
         </div>
+      </div>
+
+      <div className="card">
+        <h2 style={{ marginTop: 0 }}>Network security</h2>
+        <p className="hint">
+          The gateway protects the public model endpoint while forwarding valid requests to llama.cpp.
+          Cloudflare should target <span className="mono">127.0.0.1:{settings.securityGatewayPort}</span>.
+        </p>
+        <div className="field">
+          <label className="inline">
+            <input type="checkbox" checked={settings.securityGatewayEnabled}
+              onChange={(e) => updateSecurity("securityGatewayEnabled", e.target.checked)} />
+            Enable security gateway
+          </label>
+        </div>
+        <div className="field">
+          <label>Gateway port</label>
+          <input type="number" value={settings.securityGatewayPort}
+            onChange={(e) => updateSecurity("securityGatewayPort", Number(e.target.value))} />
+          <span className="hint">Changing the gateway port or access mode requires restarting Llama Switcher.</span>
+        </div>
+        <div className="field">
+          <label>Access mode</label>
+          <select value={settings.networkAccessMode}
+            onChange={(e) => updateSecurity("networkAccessMode", e.target.value as NetworkAccessMode)}>
+            <option value="localOnly">Local only</option>
+            <option value="cloudflareTunnel">Cloudflare Tunnel</option>
+            <option value="directInternet">Direct internet</option>
+            <option value="whitelistOnly">Whitelist only (Cloudflare-aware)</option>
+          </select>
+          <span className="hint">
+            Cloudflare mode trusts CF-Connecting-IP only when the transport connection is local.
+            Direct internet mode uses the socket address and ignores forwarded headers.
+          </span>
+        </div>
+        <div className="field">
+          <label>Trusted IPs and networks</label>
+          <textarea className="mono security-network-input" rows={4} value={settings.trustedNetworks.join("\n")}
+            placeholder={"203.0.113.10\n192.168.1.0/24\n2001:db8::/48"}
+            onChange={(e) => updateSecurity("trustedNetworks", e.target.value.split(/\r?\n|,/).map(v => v.trim()).filter(Boolean))} />
+          <span className="hint">One IPv4, IPv6, or CIDR range per line. Trusted addresses are never auto-banned.</span>
+        </div>
+        <div className="field">
+          <label className="inline">
+            <input type="checkbox" checked={settings.autoBanEnabled}
+              onChange={(e) => updateSecurity("autoBanEnabled", e.target.checked)} />
+            Automatically ban repeated invalid API keys
+          </label>
+        </div>
+        {settings.autoBanEnabled && (
+          <div className="inline">
+            <div className="field"><label>Failures</label><input type="number" min={1} value={settings.autoBanFailureThreshold} onChange={(e) => updateSecurity("autoBanFailureThreshold", Math.max(1, Number(e.target.value) || 1))} /></div>
+            <div className="field"><label>Window (seconds)</label><input type="number" min={1} value={settings.autoBanWindowSeconds} onChange={(e) => updateSecurity("autoBanWindowSeconds", Math.max(1, Number(e.target.value) || 1))} /></div>
+            <div className="field"><label>Ban duration (seconds)</label><input type="number" min={1} value={settings.autoBanDurationSeconds} onChange={(e) => updateSecurity("autoBanDurationSeconds", Math.max(1, Number(e.target.value) || 1))} /></div>
+          </div>
+        )}
+        <div className="field">
+          <label>Banned addresses</label>
+          <div className="inline">
+            <input type="text" className="mono security-network-input" value={manualBanIp} placeholder="IP address to ban" onChange={(e) => setManualBanIp(e.target.value)} />
+            <button className="btn" disabled={!manualBanIp.trim()} onClick={() => void manualBan()}>Ban</button>
+            <button className="btn" onClick={() => void refreshBans()}>Refresh</button>
+          </div>
+        </div>
+        {securityBans.length === 0 ? <span className="hint">No active bans.</span> : (
+          <div className="security-ban-list">
+            {securityBans.map((ban) => (
+              <div className="security-ban-row" key={ban.ip}>
+                <div><strong className="mono">{ban.ip}</strong><br /><span className="hint">{ban.reason} · {ban.automatic ? "Automatic" : "Manual"}{ban.expiresAt ? ` · expires ${new Date(ban.expiresAt).toLocaleString()}` : " · permanent"}</span></div>
+                <button className="btn" onClick={() => void unban(ban.ip)}>Unban</button>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="card">

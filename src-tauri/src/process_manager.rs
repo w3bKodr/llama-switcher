@@ -143,6 +143,28 @@ pub fn status_with_probe(app: &AppHandle, state: &Arc<AppState>) -> Status {
     s
 }
 
+/// Wait for llama-server to release its active slot after a client-side
+/// request timeout. The HTTP client closing its socket cancels generation, but
+/// the release is asynchronous and the next benchmark must not race it.
+pub fn wait_for_server_idle(state: &Arc<AppState>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = state.status();
+        if !status.running {
+            return true;
+        }
+        if probe_health(&status.health_url).healthy
+            && probe_usage_state(state, &status) == UsageState::Free
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Query NVIDIA GPU memory without adding a CUDA dependency. The executable is
 /// installed alongside the driver, so absence simply means this stays empty.
 fn probe_vram(server_pid: Option<u32>) -> VramStatus {
@@ -166,7 +188,10 @@ fn probe_vram(server_pid: Option<u32>) -> VramStatus {
     let mut free_mib = 0;
     let mut gpu_found = false;
     for row in String::from_utf8_lossy(&output.stdout).lines() {
-        let values: Vec<_> = row.split(',').map(|value| value.trim().parse::<u64>()).collect();
+        let values: Vec<_> = row
+            .split(',')
+            .map(|value| value.trim().parse::<u64>())
+            .collect();
         if let [Ok(total), Ok(used), Ok(free)] = values.as_slice() {
             total_mib += total;
             used_mib += used;
@@ -190,7 +215,9 @@ fn probe_vram(server_pid: Option<u32>) -> VramStatus {
         if output.status.success() {
             for row in String::from_utf8_lossy(&output.stdout).lines() {
                 let mut values = row.split(',').map(str::trim);
-                let (Some(pid), Some(name), Some(used_mib)) = (values.next(), values.next(), values.next()) else {
+                let (Some(pid), Some(name), Some(used_mib)) =
+                    (values.next(), values.next(), values.next())
+                else {
                     continue;
                 };
                 let (Ok(pid), Ok(used_mib)) = (pid.parse::<u32>(), used_mib.parse::<u64>()) else {
@@ -219,7 +246,10 @@ fn probe_vram(server_pid: Option<u32>) -> VramStatus {
         // so including it makes the process rows exceed physical VRAM usage.
         windows_processes.retain(|process| !process.name.eq_ignore_ascii_case("dwm"));
         processes = reconcile_vram_processes(windows_processes, total_mib, server_pid);
-        let process_used_mib = processes.iter().map(|process| process.used_mib).sum::<u64>();
+        let process_used_mib = processes
+            .iter()
+            .map(|process| process.used_mib)
+            .sum::<u64>();
         // Keep the headline and the breakdown on the same Windows accounting
         // basis when the cleaned allocation total is physically possible.
         if process_used_mib > 0 && process_used_mib <= total_mib {
@@ -401,6 +431,12 @@ fn probe_avg_tps(state: &Arc<AppState>, status: &Status) -> Option<f64> {
 /// when the active profile configures one; local servers without auth are
 /// probed without a header. Returns None on failure so the log fallback can run.
 fn probe_metrics_tps(state: &Arc<AppState>, status: &Status) -> Option<f64> {
+    // Some llama.cpp forks protect or reject /metrics differently from the
+    // generation API. After one auth rejection, use the captured log fallback
+    // for the rest of this model run instead of flooding its log every poll.
+    if *state.usage_probe_disabled.lock().unwrap() {
+        return None;
+    }
     let api_key = usage_probe_api_key(state, status);
     let url = format!(
         "{}/metrics",
@@ -409,11 +445,22 @@ fn probe_metrics_tps(state: &Arc<AppState>, status: &Status) -> Option<f64> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(800))
         .build();
-    let body = with_optional_bearer(agent.get(&url), api_key.as_deref())
-        .call()
-        .ok()?
-        .into_string()
-        .ok()?;
+    let response = match with_optional_bearer(agent.get(&url), api_key.as_deref()).call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status @ (401 | 403), _)) => {
+            disable_usage_probe_after_auth_status(state, status);
+            return None;
+        }
+        Err(_) if api_key.is_some() => {
+            // Some llama.cpp forks close an unauthorized connection before
+            // writing an HTTP status line. Treat that transport failure like
+            // an auth rejection so status polling cannot flood server logs.
+            *state.usage_probe_disabled.lock().unwrap() = true;
+            return None;
+        }
+        Err(_) => return None,
+    };
+    let body = response.into_string().ok()?;
 
     let tokens = parse_prometheus_metric(&body, "llamacpp:tokens_predicted_total")?;
     let seconds = parse_prometheus_metric(&body, "llamacpp:tokens_predicted_seconds_total")?;
@@ -426,6 +473,12 @@ fn probe_metrics_tps(state: &Arc<AppState>, status: &Status) -> Option<f64> {
         Some(d_tokens / d_seconds)
     } else {
         None
+    }
+}
+
+fn disable_usage_probe_after_auth_status(state: &Arc<AppState>, status: u16) {
+    if matches!(status, 401 | 403) {
+        *state.usage_probe_disabled.lock().unwrap() = true;
     }
 }
 
@@ -489,10 +542,7 @@ fn parse_gen_eval_line(line: &str) -> Option<(f64, f64)> {
 /// Parse and accumulate BeeLlama/llama.cpp speculative-decoding timing lines.
 /// Both MTP and DFlash use the same completed-request format:
 /// `draft acceptance = 0.75000 ( 141 accepted / 188 generated), ...`
-fn probe_avg_speculative_acceptance(
-    state: &Arc<AppState>,
-    status: &Status,
-) -> Option<f64> {
+fn probe_avg_speculative_acceptance(state: &Arc<AppState>, status: &Status) -> Option<f64> {
     use std::io::{Read, Seek, SeekFrom};
 
     let log_path = state
@@ -596,7 +646,9 @@ fn probe_usage_state(state: &Arc<AppState>, status: &Status) -> UsageState {
     };
     // Re-read after an endpoint timeout because the launch or release line may
     // have been flushed while the request was waiting.
-    let observed = endpoint_state.or_else(|| probe_log_usage_state(state)).or(initial_log_state);
+    let observed = endpoint_state
+        .or_else(|| probe_log_usage_state(state))
+        .or(initial_log_state);
     remember_usage_state(state, status, observed)
 }
 
@@ -614,6 +666,10 @@ fn probe_slots_usage_state(state: &Arc<AppState>, status: &Status) -> Option<Usa
     let response = match with_optional_bearer(agent.get(&url), api_key.as_deref()).call() {
         Ok(response) => response,
         Err(ureq::Error::Status(401 | 403, _)) => {
+            *state.usage_probe_disabled.lock().unwrap() = true;
+            return None;
+        }
+        Err(_) if api_key.is_some() => {
             *state.usage_probe_disabled.lock().unwrap() = true;
             return None;
         }
@@ -658,7 +714,9 @@ fn infer_log_usage_state(text: &str) -> Option<UsageState> {
     for line in text.lines().rev() {
         let lower = line.to_ascii_lowercase();
         if lower.contains("all slots are idle")
-            || (lower.contains("slot") && lower.contains("release:") && lower.contains("stop processing"))
+            || (lower.contains("slot")
+                && lower.contains("release:")
+                && lower.contains("stop processing"))
             || lower.contains("llama_server: model loaded")
         {
             return Some(UsageState::Free);
@@ -701,6 +759,15 @@ fn with_optional_bearer(request: ureq::Request, api_key: Option<&str>) -> ureq::
 }
 
 fn usage_probe_api_key(state: &Arc<AppState>, status: &Status) -> Option<String> {
+    if let Some(key) = state
+        .running
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|process| process.api_key.clone())
+    {
+        return Some(key);
+    }
     resolve_api_key(state, status.script_path.as_deref())
 }
 
@@ -728,8 +795,7 @@ fn non_empty(value: &str) -> Option<String> {
 fn api_key_from_script(path: &str) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     if let Some(raw_key) = parse_inline_api_key_from_script(&text) {
-        return expand_script_variables(&text, &raw_key)
-            .and_then(|key| non_empty(key.trim()));
+        return expand_script_variables(&text, &raw_key).and_then(|key| non_empty(key.trim()));
     }
 
     if let Some(raw_key_path) = parse_api_key_file_from_script(&text) {
@@ -957,15 +1023,7 @@ fn infer_usage_state(value: &Value) -> Option<UsageState> {
             saw_free.then_some(UsageState::Free)
         }
         Value::Object(map) => {
-            for key in [
-                "slots",
-                "data",
-                "result",
-                "items",
-                "list",
-                "slot",
-                "value",
-            ] {
+            for key in ["slots", "data", "result", "items", "list", "slot", "value"] {
                 if let Some(nested) = map.get(key) {
                     if let Some(state) = infer_usage_state(nested) {
                         return Some(state);
@@ -1021,22 +1079,21 @@ fn infer_usage_state(value: &Value) -> Option<UsageState> {
                     {
                         return Some(UsageState::Busy);
                     }
-                    if [
-                        "free",
-                        "idle",
-                        "ready",
-                        "available",
-                        "waiting",
-                    ]
-                    .iter()
-                    .any(|needle| state.contains(needle))
+                    if ["free", "idle", "ready", "available", "waiting"]
+                        .iter()
+                        .any(|needle| state.contains(needle))
                     {
                         return Some(UsageState::Free);
                     }
                 }
             }
 
-            for key in ["n_processing", "processing_count", "active_requests", "queued_requests"] {
+            for key in [
+                "n_processing",
+                "processing_count",
+                "active_requests",
+                "queued_requests",
+            ] {
                 if let Some(count) = map.get(key).and_then(Value::as_u64) {
                     return Some(if count > 0 {
                         UsageState::Busy
@@ -1060,11 +1117,11 @@ fn identify_external_profile(state: &Arc<AppState>, listener_pid: u32) -> Option
     match_profile_command_lines(&state.profiles(), &command_lines)
 }
 
-fn match_profile_command_lines(
-    profiles: &[Profile],
-    command_lines: &[String],
-) -> Option<Profile> {
-    let lines: Vec<String> = command_lines.iter().map(|line| line.to_lowercase()).collect();
+fn match_profile_command_lines(profiles: &[Profile], command_lines: &[String]) -> Option<Profile> {
+    let lines: Vec<String> = command_lines
+        .iter()
+        .map(|line| line.to_lowercase())
+        .collect();
     profiles.iter().find_map(|profile| {
         let path = profile.script_path.to_lowercase();
         let filename = std::path::Path::new(&profile.script_path)
@@ -1234,7 +1291,14 @@ fn stop_locked(app: &AppHandle, state: &Arc<AppState>) -> Result<Status, String>
 
     // 1. Kill the managed process tree (shell + all known descendants).
     let tree = process_tree::descendants(rp.pid);
-    logging::append_line(&log_path, &format!("Killing tree of {} processes (root PID {}).", tree.len(), rp.pid));
+    logging::append_line(
+        &log_path,
+        &format!(
+            "Killing tree of {} processes (root PID {}).",
+            tree.len(),
+            rp.pid
+        ),
+    );
     process_tree::kill_tree(rp.pid);
     let _ = rp.child.wait();
 
@@ -1250,7 +1314,10 @@ fn stop_locked(app: &AppHandle, state: &Arc<AppState>) -> Result<Status, String>
         }
         if let Some(pid) = pid_on_port(settings.server_port) {
             killed_count += 1;
-            logging::append_line(&log_path, &format!("Port still occupied by PID {}; killing parent tree.", pid));
+            logging::append_line(
+                &log_path,
+                &format!("Port still occupied by PID {}; killing parent tree.", pid),
+            );
             process_tree::kill_parent_tree(pid);
             thread::sleep(Duration::from_millis(500));
         } else {
@@ -1331,6 +1398,7 @@ pub fn activate_profile(
         api_key.as_deref(),
         &profile.alias,
     )?;
+    validate_gateway_backend_binding(&settings, &profile.script_path)?;
 
     // Serialize the entire start/switch so two activations cannot race and
     // leave two servers running. Held until the new server is launched.
@@ -1377,6 +1445,7 @@ pub fn activate_profile(
         let mut running = state.running.lock().unwrap();
         *running = Some(RunningProcess {
             profile: profile.clone(),
+            api_key: api_key.clone(),
             pid,
             child,
             started_at,
@@ -1396,6 +1465,27 @@ pub fn activate_profile(
     spawn_health_poller(app.clone(), Arc::clone(state), profile.id.clone(), pid);
 
     Ok(state.status())
+}
+
+fn validate_gateway_backend_binding(settings: &Settings, script_path: &str) -> Result<(), String> {
+    if !settings.security_gateway_enabled {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(script_path).map_err(|error| error.to_string())?;
+    let tokens = text.split_whitespace().collect::<Vec<_>>();
+    let public = tokens.windows(2).any(|pair| {
+        pair[0].eq_ignore_ascii_case("--host")
+            && matches!(
+                pair[1].trim_matches(['"', '\'', '^']),
+                "0.0.0.0" | "::" | "[::]"
+            )
+    });
+    if public {
+        return Err(format!(
+            "Security gateway protection requires llama-server to bind to 127.0.0.1. Change '--host 0.0.0.0' to '--host 127.0.0.1' in {script_path}."
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_port_available(app: &AppHandle, settings: &Settings) -> Result<(), String> {
@@ -1506,7 +1596,8 @@ fn spawn_health_poller(app: AppHandle, state: Arc<AppState>, profile_id: String,
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(3))
             .build();
-        let deadline = Instant::now() + Duration::from_secs(settings.health_check_timeout_seconds.max(1));
+        let deadline =
+            Instant::now() + Duration::from_secs(settings.health_check_timeout_seconds.max(1));
 
         loop {
             // Bail if this run is no longer the active one.
@@ -1579,13 +1670,7 @@ pub fn restart_server(app: &AppHandle, state: &Arc<AppState>) -> Result<Status, 
         ));
     }
 
-    wait_for_restart_ready(
-        app,
-        state,
-        &profile_id,
-        new_shell_pid,
-        old_listener_pid,
-    )
+    wait_for_restart_ready(app, state, &profile_id, new_shell_pid, old_listener_pid)
 }
 
 fn wait_for_restart_ready(
@@ -1596,8 +1681,8 @@ fn wait_for_restart_ready(
     old_listener_pid: Option<u32>,
 ) -> Result<Status, String> {
     let settings = state.settings_snapshot();
-    let deadline = Instant::now()
-        + Duration::from_secs(settings.health_check_timeout_seconds.max(1));
+    let deadline =
+        Instant::now() + Duration::from_secs(settings.health_check_timeout_seconds.max(1));
 
     loop {
         {
@@ -1606,7 +1691,9 @@ fn wait_for_restart_ready(
                 process.profile.id == profile_id && process.pid == new_shell_pid
             });
             if !still_current {
-                return Err("The replacement server exited or was superseded during restart.".into());
+                return Err(
+                    "The replacement server exited or was superseded during restart.".into(),
+                );
             }
         }
 
@@ -1647,9 +1734,11 @@ fn wait_for_restart_ready(
     }
 }
 
-fn restart_has_replacement_listener(old_listener: Option<u32>, current_listener: Option<u32>) -> bool {
-    current_listener.is_some()
-        && (old_listener.is_none() || current_listener != old_listener)
+fn restart_has_replacement_listener(
+    old_listener: Option<u32>,
+    current_listener: Option<u32>,
+) -> bool {
+    current_listener.is_some() && (old_listener.is_none() || current_listener != old_listener)
 }
 
 // ---------------------------------------------------------------------------
@@ -1685,11 +1774,16 @@ pub fn resolve_name(state: &Arc<AppState>, model: &str, feature: &str) -> Result
     let profiles = state.profiles();
     let matches: Vec<&Profile> = profiles
         .iter()
-        .filter(|p| normalize_alias(&p.pretty_model) == m && normalize_alias(&p.pretty_feature) == f)
+        .filter(|p| {
+            normalize_alias(&p.pretty_model) == m && normalize_alias(&p.pretty_feature) == f
+        })
         .collect();
     match matches.len() {
         1 => Ok(matches[0].id.clone()),
-        0 => Err(format!("No profile matches model '{}' feature '{}'.", model, feature)),
+        0 => Err(format!(
+            "No profile matches model '{}' feature '{}'.",
+            model, feature
+        )),
         _ => Err(format!(
             "Model '{}' feature '{}' is ambiguous. Matches: {}",
             model,
@@ -1746,6 +1840,7 @@ pub fn auto_start_if_configured(app: &AppHandle, state: &Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::script_scanner::ScanResult;
     use serde_json::json;
 
     fn vram_process(pid: u32, name: &str, used_mib: u64) -> VramProcess {
@@ -1754,6 +1849,21 @@ mod tests {
             name: name.into(),
             used_mib,
         }
+    }
+
+    #[test]
+    fn metrics_auth_rejection_disables_repeated_endpoint_probes() {
+        let settings = Settings::default();
+        let root =
+            std::env::temp_dir().join(format!("llama-switcher-metrics-{}", std::process::id()));
+        let state = Arc::new(AppState::new(
+            settings,
+            ScanResult::default(),
+            root.join("settings.json"),
+            root.join("logs"),
+        ));
+        disable_usage_probe_after_auth_status(&state, 401);
+        assert!(*state.usage_probe_disabled.lock().unwrap());
     }
 
     #[test]
@@ -1766,10 +1876,18 @@ mod tests {
 
         let reconciled = reconcile_vram_processes(processes, 24_576, Some(11_736));
 
-        assert!(reconciled.iter().any(|process| process.name == "llama-server"));
+        assert!(reconciled
+            .iter()
+            .any(|process| process.name == "llama-server"));
         assert!(reconciled.iter().any(|process| process.name == "explorer"));
         assert!(!reconciled.iter().any(|process| process.name == "firefox"));
-        assert!(reconciled.iter().map(|process| process.used_mib).sum::<u64>() <= 24_576);
+        assert!(
+            reconciled
+                .iter()
+                .map(|process| process.used_mib)
+                .sum::<u64>()
+                <= 24_576
+        );
     }
 
     #[test]
@@ -1834,12 +1952,17 @@ mod tests {
         assert!(parse_gen_eval_line(prompt).is_none());
 
         // total time and streaming (tg) lines are not generation eval lines.
-        assert!(parse_gen_eval_line("... |       total time =    8582.90 ms /  8597 tokens").is_none());
+        assert!(
+            parse_gen_eval_line("... |       total time =    8582.90 ms /  8597 tokens").is_none()
+        );
         assert!(parse_gen_eval_line("... | n_decoded =    100, tg = 111.10 t/s").is_none());
 
         // Cumulative average over two generations.
         let (t1, m1) = parse_gen_eval_line(gen).unwrap();
-        let (t2, m2) = parse_gen_eval_line("eval time = 1499.76 ms / 62 tokens ( 24.19 ms per token, 41.34 tokens per second)").unwrap();
+        let (t2, m2) = parse_gen_eval_line(
+            "eval time = 1499.76 ms / 62 tokens ( 24.19 ms per token, 41.34 tokens per second)",
+        )
+        .unwrap();
         let avg = (t1 + t2) / ((m1 + m2) / 1000.0);
         assert!((avg - 39.78).abs() < 0.1);
     }
@@ -1877,10 +2000,7 @@ mod tests {
     fn matches_external_profile_from_parent_command_line() {
         let profiles = vec![
             profile(r"D:\llama\start - qwen-9B - MTP.cmd", "qwen-9b-mtp"),
-            profile(
-                r"D:\llama\start - qwen-27B - Vision.cmd",
-                "qwen-27b-vision",
-            ),
+            profile(r"D:\llama\start - qwen-27B - Vision.cmd", "qwen-27b-vision"),
         ];
         let lines = vec![
             r#"E:\llama.cpp\llama-server.exe --port 1234"#.to_string(),
@@ -1976,7 +2096,10 @@ mod tests {
             llama-server.exe --port 1234
         "#;
 
-        assert_eq!(parse_api_key_from_script(script).as_deref(), Some("sk-test-123"));
+        assert_eq!(
+            parse_api_key_from_script(script).as_deref(),
+            Some("sk-test-123")
+        );
     }
 
     #[test]
@@ -1987,7 +2110,10 @@ mod tests {
               --port 1234
         "#;
 
-        assert_eq!(parse_api_key_from_script(script).as_deref(), Some("sk-flag-456"));
+        assert_eq!(
+            parse_api_key_from_script(script).as_deref(),
+            Some("sk-flag-456")
+        );
     }
 
     #[test]

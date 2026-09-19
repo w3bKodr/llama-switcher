@@ -55,12 +55,7 @@ pub fn create_run_log(logs_dir: &Path, profile: &Profile, pid: Option<u32>) -> P
 /// Append a labelled line to a run log (used for stop/exit/health/errors).
 pub fn append_line(path: &Path, line: &str) {
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(
-            f,
-            "[{}] {}",
-            chrono::Local::now().format("%H:%M:%S"),
-            line
-        );
+        let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S"), line);
     }
 }
 
@@ -132,8 +127,13 @@ pub fn read_log_update(path: &Path, offset: u64) -> Result<LogUpdate, String> {
     let mut file = File::open(path).map_err(|e| e.to_string())?;
     let len = file.metadata().map_err(|e| e.to_string())?.len();
 
-    let (start, truncated) = if offset > len { (0, true) } else { (offset, false) };
-    file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+    let (start, truncated) = if offset > len {
+        (0, true)
+    } else {
+        (offset, false)
+    };
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| e.to_string())?;
 
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
@@ -195,6 +195,9 @@ mod tests {
             "real model line\n",
         );
 
-        assert_eq!(filter_log_noise(text), "real startup line\nreal model line\n");
+        assert_eq!(
+            filter_log_noise(text),
+            "real startup line\nreal model line\n"
+        );
     }
 }

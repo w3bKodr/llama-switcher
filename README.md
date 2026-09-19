@@ -1,164 +1,143 @@
 # Llama Switcher
 
-A very lightweight **Windows system-tray** desktop app for switching between
-**llama.cpp** server startup scripts. Built with **Tauri v2 + Rust** (all backend
-logic) and a small **React + TypeScript + Vite** dashboard.
+<p align="center">
+  <img src="src-tauri/icons/icon.png" alt="Llama Switcher icon" width="112">
+</p>
 
-- Tray-first: starts minimized to the notification area, dashboard opens on demand.
-- Rust owns everything: process management, script scanning, the local control
-  API, logging, settings, tray menu, and Windows process-tree killing.
-- One llama.cpp server at a time. Switching stops the current one (whole process
-  tree), waits for it to exit, frees the port, then launches the new script.
-- A local HTTP API (127.0.0.1 only, bearer-token auth) lets **Hermes Agent**
-  control the app. Hermes never runs scripts directly.
-- An optional transparent desktop widget shows the loaded model, feature, VRAM,
-  generation speed, and live usage without opening the full dashboard.
-- Benchmark runs can target any subset of saved prompts; skipped prompts remain
-  available for future runs and are excluded from run counts and progress.
-- Completed benchmark runs trigger a native Windows toast notification, even
-  when the dashboard is hidden in the system tray.
+<p align="center"><strong>A polished Windows control center for local llama.cpp servers.</strong></p>
 
-> **Hermes is not a llama.cpp model/profile.** It is a separate agent that
-> controls Llama Switcher through the local API or the `hermes-skill/` adapter.
+Llama Switcher turns a folder of launch scripts into a dependable desktop workflow. Start or switch models, watch live generation telemetry, compare models with repeatable benchmarks, secure an internet-facing endpoint, and keep essential status visible from the Windows notification area or optional desktop widget.
 
-## How profiles are detected
+![Llama Switcher dashboard](docs/images/llama-switcher-dashboard.png)
 
-Point the app at a scripts folder (default `D:\llama`). It scans for files named:
+## Highlights
 
-```
+- **One-click model switching.** Detects named `.cmd`, `.bat`, and PowerShell profiles, safely stops the current process tree, frees the configured port, and launches the selected server.
+- **Live operational telemetry.** Shows health, current activity, average tokens per second, speculative-decoding acceptance, process information, and GPU-memory usage.
+- **Professional benchmarks.** Run deterministic JavaScript coding tests at easy, medium, and hard levels, add custom generation tests, repeat each evaluation, enforce timeouts, pause or cancel runs, and resume verified results after a crash.
+- **Shareable reports.** Produces a self-contained HTML report with model comparisons, accuracy charts, latency, throughput, and speculative-acceptance data.
+- **Desktop widget.** A compact always-on-top monitor keeps model, state, speed, and VRAM information visible without opening the main window.
+- **Internet-facing security controls.** Optional API-key gateway, trusted IP/network rules, Cloudflare-aware client addressing, automatic temporary bans, and a manageable ban list.
+- **Tray-first Windows experience.** Runs quietly in the notification area, where the icon color communicates whether the server is ready, generating, starting, unavailable, or stopped.
+- **Local automation API.** A loopback-only authenticated API and Hermes adapter allow agents to inspect and control Llama Switcher without launching scripts directly.
+
+## Desktop widget
+
+![Llama Switcher desktop widget](docs/images/llama-switcher-widget.png)
+
+The optional widget displays the loaded model and feature, server state, tokens per second, total GPU-memory usage, model allocation, and available memory. It supports transparency, glass blur, always-on-top behavior, refresh-rate controls, and Windows startup registration.
+
+The widget installer ships with packaged builds. Open **Settings → Desktop widget → Install widget**; Llama Switcher can also configure the widget to start with Windows.
+
+## Supported servers and hardware
+
+Llama Switcher is designed around the OpenAI-compatible HTTP interface and console output used by **llama.cpp**, **BeeLlama**, and compatible llama.cpp forks. Because profiles are ordinary launch scripts, custom arguments, speculative decoding, alternative binaries, environment variables, and model-specific tuning remain under your control.
+
+Model management, health monitoring, logs, benchmarks, and most telemetry are hardware-agnostic. Detailed system and per-process **VRAM reporting currently uses NVIDIA tooling**, so those memory panels require a supported NVIDIA GPU and driver. The rest of the application can still be used with CPU-only servers or other GPU backends.
+
+## Profile discovery
+
+Point Llama Switcher at a scripts folder (the initial default is `D:\llama`). It recognizes:
+
+```text
 start - {model} - {feature}.cmd
 start - {model} - {feature}.bat
 start - {model} - {feature}.ps1
 ```
 
-and builds a profile for each. Examples:
+For example, `start - Qwen3.5-9B-Q4_K_S - MTP.cmd` becomes the profile **Qwen3.5-9B-Q4_K_S MTP**. Files that do not match are listed with an explanation instead of being silently ignored.
 
-| File | Alias |
-| --- | --- |
-| `start - qwen-27B - MTP.cmd` | **Qwen-27B MTP** |
-| `start - qwen-27B - Vision.cmd` | **Qwen-27B Vision** |
-| `start - qwen-4B - Vision.cmd` | **Qwen-4B Vision** |
-| `start - llama-70B - Standard.cmd` | **Llama-70B Standard** |
-| `start - mistral-7B - CPU.cmd` | **Mistral-7B CPU** |
+When a profile starts, Llama Switcher captures the exact API credential used by the script in memory and reuses it for authenticated health and telemetry probes. Credentials are not copied into reports or logs.
 
-Files that don't match are reported as *ignored* (with a reason) in the dashboard.
+## Benchmark workspace
 
-## Prerequisites
+The benchmark workspace is intended for practical local-model comparisons, not just prompt timing:
 
-- Windows 10/11
-- [Rust](https://rustup.rs/) (stable) + the MSVC build tools
-- [Node.js](https://nodejs.org/) 18+
-- WebView2 runtime (preinstalled on Windows 11)
+- 18 bundled coding cases: six easy, six medium, and six hard.
+- Hidden deterministic tests grade correctness without exposing expected answers to the model.
+- Custom tests measure free-form generation performance.
+- Configurable repetitions and generation, startup, and grading timeouts.
+- Safe pause between evaluations, explicit resume, and a separate cancel action.
+- Crash recovery from fingerprint-verified completed results in the selected output folder.
+- Partial and timed-out answers are recorded as graded failures rather than discarded as generic network errors.
+- Offline HTML reports aggregate every repetition and compare correctness, duration, tokens per second, and speculative acceptance.
 
-## Install & run (development)
+To start over rather than recover saved work, cancel the active benchmark and disable **Resume verified completed runs** before starting the next run.
 
-```bash
+## Security gateway
+
+The optional gateway is **off by default for new installations**, keeping the initial setup simple and local. Existing installations retain their saved choice when upgrading.
+
+When enabled, it can protect a directly exposed or Cloudflare-tunneled llama.cpp endpoint with:
+
+- API-key authentication.
+- Local-only or internet-reachable binding modes.
+- Trusted IPv4, IPv6, and CIDR entries.
+- Automatic temporary bans after a configurable number of failed keys.
+- A visible ban list with manual ban, refresh, and unban controls.
+- Cloudflare `CF-Connecting-IP` support only when the transport peer is trusted/local, preventing forged forwarding headers on direct connections.
+
+Expose a local model only after configuring authentication and reviewing the network and tunnel rules that apply to your environment.
+
+## Logs and resilience
+
+Each managed launch receives a dedicated run log. The Logs page makes recent server output available without hunting through terminals. Llama Switcher recognizes Windows timeout conditions, waits for cancelled llama.cpp slots to become idle before continuing a benchmark, and avoids reusing stale result metadata after a failed attempt.
+
+## Hermes and local automation
+
+The local control API binds to `127.0.0.1` and requires a bearer token except for its health endpoint. Hermes—or another local tool—can list profiles, inspect status, and request start, stop, switch, or restart operations while Llama Switcher remains responsible for process ownership.
+
+See [HERMES_AGENT_TOOLING.md](HERMES_AGENT_TOOLING.md) and [hermes-skill/README.md](hermes-skill/README.md) for the API and adapter documentation.
+
+## Development
+
+### Prerequisites
+
+- Windows 10 or 11
+- [Node.js](https://nodejs.org/) 18 or newer
+- [Rust](https://rustup.rs/) stable with the MSVC build tools
+- WebView2 Runtime (included with Windows 11)
+
+### Run locally
+
+```powershell
 npm install
 npm run tauri dev
 ```
 
-The first build also needs app icons. If `src-tauri/icons/` is empty, generate
-them once (requires a source PNG, or use the included generator):
+### Build the main installer
 
-```bash
-# from the project root, with a 512x512 source image:
-npm run tauri icon path\to\icon.png
-```
-
-A simple placeholder generator (`scripts/generate-icons.ps1`) is included for
-getting started — run it with PowerShell to produce basic icons.
-
-## Build a release installer
-
-```bash
+```powershell
 npm run tauri build
 ```
 
-Produces an NSIS installer under `src-tauri/target/release/bundle/`.
+The NSIS installer is written beneath `src-tauri/target/release/bundle/nsis/`. The main release build also packages the current widget installer so it can be launched from Settings.
+
+### Build the widget separately
+
+```powershell
+cd widget
+npm install
+npm run tauri build
+```
+
+The widget installer is written beneath `widget/src-tauri/target/release/bundle/nsis/`.
 
 ## Project layout
 
-```
-src/                     React + TS dashboard (Status, Detected Scripts,
-                         Settings, Logs, Agent Control)
-src-tauri/src/
-  settings.rs            Load/save settings JSON in app data dir
-  script_scanner.rs      Folder scan -> profiles + ignored files
-  alias_formatter.rs     Pretty model/feature names, aliases, matching
-  process_manager.rs     Start/stop/switch/restart, port checks, health polling
-  process_tree.rs        Windows-safe process-tree termination
-  local_api.rs           127.0.0.1 control API (bearer token)
-  tray.rs                Dynamic tray menu
-  logging.rs             Per-run log files
-  state.rs               Shared app state
-  lib.rs                 Tauri commands + setup
-hermes-skill/            TypeScript adapter for Hermes Agent
-widget/                  Standalone transparent Windows telemetry widget
-HERMES_AGENT_TOOLING.md  Full local API + agent tooling reference
+```text
+src/                         React + TypeScript dashboard
+src-tauri/src/               Rust process, telemetry, security, and benchmark core
+widget/                      Standalone Tauri telemetry widget
+hermes-skill/                Hermes Agent adapter
+docs/images/                 README product screenshots
+HERMES_AGENT_TOOLING.md      Local automation API reference
 ```
 
-## Desktop widget
+## Design principles
 
-The standalone widget lives in [`widget/`](widget/). It displays the current
-model and feature, total and model VRAM usage, average tokens per second, and
-whether the server is ready or generating. Short local-API stalls retain the
-last valid telemetry and show a reconnecting state instead of incorrectly
-reporting that Llama Switcher has stopped.
-
-Widget settings include transparency, glass blur, always-on-top behavior,
-Windows startup registration, and the telemetry refresh interval. To develop or
-build it separately:
-
-Packaged Llama Switcher builds include the widget installer. Open **Settings →
-Desktop widget** and click **Install widget**; the app asks whether the widget
-should start with Windows before launching the installer.
-
-```bash
-cd widget
-npm install
-npm run tauri dev
-npm run tauri build
-```
-
-The widget installer is produced under
-`widget/src-tauri/target/release/bundle/nsis/`.
-
-## Settings
-
-The **Start Llama Switcher with Windows** toggle uses the current user's Windows Run registration and is independent of script rescanning or profile auto-start. Other settings are stored as JSON in the app data directory (`%APPDATA%\com.llamaswitcher.app\settings.json`):
-
-```json
-{
-  "scriptsFolder": "D:\\llama",
-  "scanPattern": "start - {model} - {feature}",
-  "allowedExtensions": [".cmd", ".bat", ".ps1"],
-  "serverPort": 8080,
-  "healthUrl": "http://127.0.0.1:8080/health",
-  "agentApiPort": 47891,
-  "agentApiToken": "generated-random-token",
-  "autoRescanOnStartup": true,
-  "autoRescanIntervalSeconds": null,
-  "defaultProfileMode": "none",
-  "defaultProfileId": null,
-  "lastUsedProfileId": null,
-  "stopTimeoutSeconds": 15,
-  "healthCheckTimeoutSeconds": 60
-}
-```
-
-## Runtime behavior
-
-- The control API binds to `127.0.0.1` only and requires `Authorization: Bearer
-  <token>` for every endpoint except `GET /health`.
-- Start / Switch always takes ownership of the configured server port by
-  stopping its current listener first, including externally launched servers.
-- When an external listener's process ancestry names a detected startup script,
-  Llama Switcher automatically relaunches that same profile under management so
-  model/feature metadata, Restart, and captured run logs are immediately available.
-- No background polling loops unless you enable an auto-rescan interval. Health
-  checks only run during the startup window of a launch.
-
-## Hermes Agent
-
-See [HERMES_AGENT_TOOLING.md](HERMES_AGENT_TOOLING.md) and
-[`hermes-skill/README.md`](hermes-skill/README.md).
+- Keep model launch configuration in readable scripts owned by the user.
+- Let one component own the server process and its entire child tree.
+- Prefer local, inspectable state and self-contained benchmark artifacts.
+- Make failures recoverable and operational state obvious at a glance.
+- Keep internet exposure optional, explicit, and independently configurable.

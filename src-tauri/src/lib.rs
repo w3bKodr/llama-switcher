@@ -2,12 +2,15 @@
 
 mod alias_formatter;
 mod benchmark;
+mod benchmark_catalog;
+mod benchmark_report;
 mod hermes_install;
 mod local_api;
 mod logging;
 mod process_manager;
 mod process_tree;
 mod script_scanner;
+mod security;
 mod settings;
 mod state;
 mod tray;
@@ -28,6 +31,10 @@ use state::{AppState, Status};
 use serde::Serialize;
 use tauri::image::Image;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+pub fn run_grader_mode() -> Option<i32> {
+    benchmark_catalog::run_grader_mode()
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers (used by tray + local_api)
@@ -180,6 +187,15 @@ fn save_settings(
     state: State<'_, Arc<AppState>>,
     settings: Settings,
 ) -> Result<Settings, String> {
+    security::validate_networks(&settings.trusted_networks)?;
+    if settings.security_gateway_enabled
+        && (settings.security_gateway_port == settings.server_port
+            || settings.security_gateway_port == settings.agent_api_port)
+    {
+        return Err(
+            "The security gateway port must differ from the llama.cpp and agent API ports.".into(),
+        );
+    }
     {
         let mut s = state.settings.lock().unwrap();
         *s = settings.clone();
@@ -190,6 +206,21 @@ fn save_settings(
     let st = state.inner().clone();
     rescan_and_store(&app, &st);
     Ok(settings)
+}
+
+#[tauri::command]
+fn list_security_bans(state: State<'_, Arc<AppState>>) -> Vec<security::BanEntry> {
+    security::list_bans(&state)
+}
+
+#[tauri::command]
+fn unban_security_ip(state: State<'_, Arc<AppState>>, ip: String) -> Result<(), String> {
+    security::unban(&state, &ip)
+}
+
+#[tauri::command]
+fn ban_security_ip(state: State<'_, Arc<AppState>>, ip: String) -> Result<(), String> {
+    security::manual_ban(&state, &ip)
 }
 
 #[tauri::command]
@@ -328,6 +359,19 @@ fn get_benchmark_config(state: State<'_, Arc<AppState>>) -> benchmark::Benchmark
 }
 
 #[tauri::command]
+fn get_professional_benchmark_catalog() -> Vec<benchmark_catalog::ProfessionalBenchmarkSummary> {
+    benchmark::professional_catalog()
+}
+
+#[tauri::command]
+fn get_benchmark_resume_count(
+    state: State<'_, Arc<AppState>>,
+    config: benchmark::BenchmarkConfig,
+) -> usize {
+    benchmark::resumable_run_count(state.inner(), &config)
+}
+
+#[tauri::command]
 fn save_benchmark_config(
     state: State<'_, Arc<AppState>>,
     config: benchmark::BenchmarkConfig,
@@ -340,13 +384,24 @@ fn run_benchmark(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     config: benchmark::BenchmarkConfig,
+    start_fresh: bool,
 ) -> Result<(), String> {
-    benchmark::start(app, state.inner().clone(), config)
+    benchmark::start(app, state.inner().clone(), config, start_fresh)
 }
 
 #[tauri::command]
 fn cancel_benchmark(app: AppHandle, state: State<'_, Arc<AppState>>) {
     benchmark::cancel(&app, state.inner());
+}
+
+#[tauri::command]
+fn pause_benchmark(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    benchmark::pause(&app, state.inner())
+}
+
+#[tauri::command]
+fn resume_benchmark(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    benchmark::resume(&app, state.inner())
 }
 
 #[tauri::command]
@@ -395,6 +450,11 @@ fn open_scripts_folder(state: State<'_, Arc<AppState>>) {
 #[tauri::command]
 fn open_path(path: String) {
     open_folder(&path);
+}
+
+#[tauri::command]
+fn open_benchmark_report(path: String) -> Result<(), String> {
+    tauri_plugin_opener::open_path(path, None::<&str>).map_err(|error| error.to_string())
 }
 
 #[derive(Serialize)]
@@ -866,6 +926,7 @@ pub fn run() {
 
             // Local control API on 127.0.0.1.
             local_api::start(handle.clone(), state.clone());
+            security::start(handle.clone(), state.clone());
 
             // Lightweight live monitor for tray state and open dashboards.
             {
@@ -928,6 +989,9 @@ pub fn run() {
             is_server_reachable,
             get_settings,
             save_settings,
+            list_security_bans,
+            unban_security_ip,
+            ban_security_ip,
             rescan_scripts,
             get_detected_profiles,
             get_scan_result,
@@ -946,6 +1010,7 @@ pub fn run() {
             open_logs_folder,
             open_scripts_folder,
             open_path,
+            open_benchmark_report,
             get_agent_api_info,
             regenerate_agent_api_token,
             browse_folder,
@@ -956,9 +1021,13 @@ pub fn run() {
             get_widget_install_status,
             install_widget,
             get_benchmark_config,
+            get_professional_benchmark_catalog,
+            get_benchmark_resume_count,
             save_benchmark_config,
             run_benchmark,
             cancel_benchmark,
+            pause_benchmark,
+            resume_benchmark,
             is_benchmark_running
         ])
         .run(tauri::generate_context!())

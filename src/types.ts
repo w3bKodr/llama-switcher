@@ -27,6 +27,16 @@ export interface ScanResult {
 }
 
 export type DefaultProfileMode = "none" | "lastUsed" | "specific";
+export type NetworkAccessMode = "localOnly" | "cloudflareTunnel" | "directInternet" | "whitelistOnly";
+
+export interface SecurityBan {
+  ip: string;
+  reason: string;
+  failureCount: number;
+  createdAt: string;
+  expiresAt: string | null;
+  automatic: boolean;
+}
 
 export interface Settings {
   scriptsFolder: string;
@@ -36,6 +46,14 @@ export interface Settings {
   healthUrl: string;
   llamaServerApiKey: string | null;
   requireServerApiKey: boolean;
+  securityGatewayEnabled: boolean;
+  securityGatewayPort: number;
+  networkAccessMode: NetworkAccessMode;
+  trustedNetworks: string[];
+  autoBanEnabled: boolean;
+  autoBanFailureThreshold: number;
+  autoBanWindowSeconds: number;
+  autoBanDurationSeconds: number;
   agentApiPort: number;
   agentApiToken: string;
   autoRescanOnStartup: boolean;
@@ -92,18 +110,50 @@ export interface BenchmarkPrompt {
   enabled: boolean;
 }
 
+export type BenchmarkDifficulty = "easy" | "medium" | "hard";
+
+export interface ProfessionalBenchmarkSummary {
+  id: string;
+  suiteId: string;
+  suiteVersion: number;
+  title: string;
+  description: string;
+  difficulty: BenchmarkDifficulty;
+  weight: number;
+  prompt: string;
+  functionSignature: string;
+  publicTestCount: number;
+  totalTestCount: number;
+}
+
+export interface BenchmarkGrade {
+  benchmarkId: string;
+  suiteVersion: number;
+  status: string;
+  score: number;
+  passed: number;
+  failed: number;
+  total: number;
+  feedback: string[];
+}
+
 export interface BenchmarkConfig {
   profileIds: string[];
   prompts: BenchmarkPrompt[];
+  professionalCaseIds: string[];
   outputDir: string;
   timeoutSeconds: number;
   modelStartTimeoutSeconds: number;
+  gradingTimeoutSeconds: number;
   runsPerPrompt: number;
+  generateHtmlReport: boolean;
+  openReportWhenComplete: boolean;
+  resumeCompletedRuns: boolean;
 }
 
 export interface BenchmarkProgress {
   kind: "run" | "model" | "prompt";
-  status: "running" | "iteration_done" | "iteration_error" | "done" | "error" | "switching" | "finished" | "cancelled";
+  status: "running" | "pausing" | "paused" | "resumed" | "iteration_done" | "iteration_error" | "done" | "error" | "switching" | "finished" | "cancelled";
   profileId: string | null;
   alias: string | null;
   promptId: string | null;
@@ -116,6 +166,11 @@ export interface BenchmarkProgress {
   draftTokens: number | null;
   acceptedDraftTokens: number | null;
   speculativeAcceptanceRate: number | null;
+  score: number | null;
+  passedTests: number | null;
+  totalTests: number | null;
+  gradeStatus: string | null;
+  reportPath: string | null;
 }
 
 export interface AgentApiInfo {
