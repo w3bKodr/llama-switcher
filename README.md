@@ -12,7 +12,7 @@ Llama Switcher turns a folder of launch scripts into a dependable desktop workfl
 
 ## Highlights
 
-- **One-click model switching.** Detects named `.cmd`, `.bat`, and PowerShell profiles, safely stops the current process tree, frees the configured port, and launches the selected server.
+- **One-click model switching and concurrent models.** Detects named `.cmd`, `.bat`, and PowerShell profiles, replaces only the model using the same `--port`, and can keep a configurable number of models running on distinct ports.
 - **Live operational telemetry.** Shows health, current activity, average tokens per second, speculative-decoding acceptance, process information, and GPU-memory usage.
 - **Professional benchmarks.** Run deterministic JavaScript coding tests at easy, medium, and hard levels, add custom generation tests, repeat each evaluation, enforce timeouts, pause or cancel runs, and resume verified results after a crash.
 - **Shareable reports.** Produces a self-contained HTML report with model comparisons, accuracy charts, latency, throughput, and speculative-acceptance data.
@@ -48,6 +48,8 @@ start - {model} - {feature}.ps1
 For example, `start - Qwen3.5-9B-Q4_K_S - MTP.cmd` becomes the profile **Qwen3.5-9B-Q4_K_S MTP**. Files that do not match are listed with an explanation instead of being silently ignored.
 
 When a profile starts, Llama Switcher captures the exact API credential used by the script in memory and reuses it for authenticated health and telemetry probes. Credentials are not copied into reports or logs.
+
+The configured server port (1234 by default) is always the main model used by status, benchmarks, and the optional security gateway. Additional profiles may run concurrently when their scripts specify a different `--port`; the gateway never forwards to those auxiliary ports.
 
 ## Benchmark workspace
 

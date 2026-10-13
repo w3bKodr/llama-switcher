@@ -35,6 +35,10 @@ pub struct Settings {
     pub allowed_extensions: Vec<String>,
     pub server_port: u16,
     pub health_url: String,
+    /// Maximum number of distinct llama-server profiles Llama Switcher may
+    /// manage concurrently. Profiles must listen on different ports.
+    #[serde(default = "default_max_simultaneous_models")]
+    pub max_simultaneous_models: usize,
     /// Optional fallback server API key. It is injected as `LLAMA_API_KEY` when
     /// launching a profile and is also used for protected status probes.
     #[serde(default)]
@@ -87,6 +91,10 @@ fn default_server_process_names() -> Vec<String> {
     vec!["llama-server.exe".into()]
 }
 
+fn default_max_simultaneous_models() -> usize {
+    1
+}
+
 fn default_require_server_api_key() -> bool {
     true
 }
@@ -115,6 +123,7 @@ impl Default for Settings {
             allowed_extensions: vec![".cmd".into(), ".bat".into(), ".ps1".into()],
             server_port: 1234,
             health_url: "http://127.0.0.1:1234/health".to_string(),
+            max_simultaneous_models: default_max_simultaneous_models(),
             llama_server_api_key: None,
             require_server_api_key: true,
             security_gateway_enabled: false,

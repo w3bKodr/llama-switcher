@@ -173,7 +173,14 @@ async fn get_status(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<S
 #[tauri::command]
 fn is_server_reachable(state: State<'_, Arc<AppState>>) -> bool {
     let settings = state.settings_snapshot();
-    process_manager::probe_reachable(&settings.health_url)
+    let key = state
+        .running
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|process| process.api_key.clone())
+        .or(settings.llama_server_api_key);
+    process_manager::probe_reachable_with_key(&settings.health_url, key.as_deref())
 }
 
 #[tauri::command]
@@ -188,6 +195,9 @@ fn save_settings(
     settings: Settings,
 ) -> Result<Settings, String> {
     security::validate_networks(&settings.trusted_networks)?;
+    if settings.max_simultaneous_models == 0 || settings.max_simultaneous_models > 16 {
+        return Err("Maximum simultaneous models must be between 1 and 16.".into());
+    }
     if settings.security_gateway_enabled
         && (settings.security_gateway_port == settings.server_port
             || settings.security_gateway_port == settings.agent_api_port)
@@ -342,6 +352,21 @@ async fn stop_server(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<
     tauri::async_runtime::spawn_blocking(move || process_manager::stop_server(&app, &st))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn stop_profile(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    profile_id: String,
+) -> Result<Status, String> {
+    ensure_not_benchmarking(state.inner())?;
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        process_manager::stop_profile(&app, &st, &profile_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1001,6 +1026,7 @@ pub fn run() {
             switch_profile_by_name,
             switch_profile_by_alias,
             stop_server,
+            stop_profile,
             restart_server,
             read_latest_log,
             read_log,

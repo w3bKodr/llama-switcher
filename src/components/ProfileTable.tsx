@@ -129,6 +129,19 @@ export function ProfileTable({
     }
   }
 
+  async function stop(profile: Profile) {
+    setBusy(profile.id);
+    try {
+      await api.stopProfile(profile.id);
+      showToast(`${profile.alias} stopped.`);
+      onAction();
+    } catch (e) {
+      showToast(`Could not stop ${profile.alias}: ${String(e)}`, true);
+    } finally {
+      setBusy(null);
+    }
+  }
+
   if (profiles.length === 0) {
     return null;
   }
@@ -136,7 +149,7 @@ export function ProfileTable({
   return (
     <div ref={gridRef} className={`profile-grid ${reorderable ? "favorite-grid" : ""}`}>
       {profiles.map((profile, index) => {
-        const isCurrent = status?.running && status.currentProfileId === profile.id;
+        const isCurrent = status?.runningProfileIds?.includes(profile.id) ?? false;
         const isFavorite = favoriteIds.includes(profile.id);
         const isDragged = drag?.id === profile.id;
         const filename = profile.scriptPath.split(/[\\/]/).pop() ?? profile.scriptPath;
@@ -222,13 +235,24 @@ export function ProfileTable({
               <span className={`profile-state ${isCurrent ? "online" : ""}`}>
                 <i />{isCurrent ? "Running now" : "Ready"}
               </span>
-              <button
-                className={`btn small ${isCurrent ? "" : "primary"}`}
-                disabled={busy !== null}
-                onClick={() => void run(profile)}
-              >
-                {busy === profile.id ? "Starting…" : isCurrent ? "Restart" : "Start"}
-              </button>
+              <div className="inline">
+                <button
+                  className={`btn small ${isCurrent ? "" : "primary"}`}
+                  disabled={busy !== null}
+                  onClick={() => void run(profile)}
+                >
+                  {busy === profile.id ? "Working…" : isCurrent ? "Restart" : "Start"}
+                </button>
+                {isCurrent && (
+                  <button
+                    className="btn small"
+                    disabled={busy !== null}
+                    onClick={() => void stop(profile)}
+                  >
+                    Stop
+                  </button>
+                )}
+              </div>
             </div>
             </article>
           </Fragment>

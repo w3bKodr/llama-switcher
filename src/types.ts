@@ -44,6 +44,7 @@ export interface Settings {
   allowedExtensions: string[];
   serverPort: number;
   healthUrl: string;
+  maxSimultaneousModels: number;
   llamaServerApiKey: string | null;
   requireServerApiKey: boolean;
   securityGatewayEnabled: boolean;
@@ -71,6 +72,7 @@ export interface Settings {
 
 export interface Status {
   running: boolean;
+  runningProfileIds: string[];
   currentProfileId: string | null;
   alias: string | null;
   currentProfileName: string | null;

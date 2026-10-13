@@ -38,6 +38,8 @@ export const api = {
   switchProfileByAlias: (alias: string) =>
     invoke<Status>("switch_profile_by_alias", { alias }),
   stopServer: () => invoke<Status>("stop_server"),
+  stopProfile: (profileId: string) =>
+    invoke<Status>("stop_profile", { profileId }),
   restartServer: () => invoke<Status>("restart_server"),
 
   readLatestLog: () => invoke<string>("read_latest_log"),

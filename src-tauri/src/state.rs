@@ -32,6 +32,9 @@ pub struct AppState {
     pub settings: Mutex<Settings>,
     pub scan: Mutex<ScanResult>,
     pub running: Mutex<Option<RunningProcess>>,
+    /// Additional managed servers on ports other than the configured main
+    /// port. The main `running` process remains the only gateway backend.
+    pub auxiliary_running: Mutex<Vec<RunningProcess>>,
     /// Serializes start/stop/switch so two launches can never race and leave two
     /// servers running. Held for the whole duration of an activate or stop.
     pub op_lock: Mutex<()>,
@@ -133,6 +136,7 @@ impl AppState {
             settings: Mutex::new(settings),
             scan: Mutex::new(scan),
             running: Mutex::new(None),
+            auxiliary_running: Mutex::new(Vec::new()),
             op_lock: Mutex::new(()),
             takeover_lock: Mutex::new(()),
             external_pid_checked: Mutex::new(None),
@@ -176,6 +180,7 @@ impl AppState {
 #[serde(rename_all = "camelCase")]
 pub struct Status {
     pub running: bool,
+    pub running_profile_ids: Vec<String>,
     pub current_profile_id: Option<String>,
     pub alias: Option<String>,
     pub current_profile_name: Option<String>,
@@ -224,30 +229,63 @@ pub struct VramProcess {
 
 impl AppState {
     pub fn status(&self) -> Status {
-        let settings = self.settings.lock().unwrap();
-        let running = self.running.lock().unwrap();
-        match running.as_ref() {
-            Some(rp) => Status {
-                running: true,
-                current_profile_id: Some(rp.profile.id.clone()),
-                alias: Some(rp.profile.alias.clone()),
-                current_profile_name: Some(rp.profile.display_name.clone()),
-                model: Some(rp.profile.pretty_model.clone()),
-                feature: Some(rp.profile.pretty_feature.clone()),
-                script_path: Some(rp.profile.script_path.clone()),
-                pid: Some(rp.pid),
-                healthy: rp.healthy,
-                server_reachable: false,
-                server_port: settings.server_port,
-                health_url: settings.health_url.clone(),
-                started_at: Some(rp.started_at.clone()),
-                usage_state: UsageState::Unknown,
-                avg_tokens_per_second: None,
-                avg_speculative_acceptance_rate: None,
-                vram: VramStatus::default(),
-            },
+        // Never hold more than one state mutex at a time. Gateway requests,
+        // process operations, tray refreshes, and status polling run on
+        // different threads; nested locks here previously participated in a
+        // running <-> settings lock-order deadlock.
+        let (server_port, health_url) = {
+            let settings = self.settings.lock().unwrap();
+            (settings.server_port, settings.health_url.clone())
+        };
+        let mut running_profile_ids = self
+            .auxiliary_running
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|process| process.profile.id.clone())
+            .collect::<Vec<_>>();
+        let main = self.running.lock().unwrap().as_ref().map(|rp| {
+            (
+                rp.profile.id.clone(),
+                rp.profile.alias.clone(),
+                rp.profile.display_name.clone(),
+                rp.profile.pretty_model.clone(),
+                rp.profile.pretty_feature.clone(),
+                rp.profile.script_path.clone(),
+                rp.pid,
+                rp.healthy,
+                rp.started_at.clone(),
+            )
+        });
+        match main {
+            Some((id, alias, name, model, feature, script_path, pid, healthy, started_at)) => {
+                running_profile_ids.insert(0, id.clone());
+                Status {
+                    running: true,
+                    running_profile_ids,
+                    current_profile_id: Some(id),
+                    alias: Some(alias),
+                    current_profile_name: Some(name),
+                    model: Some(model),
+                    feature: Some(feature),
+                    script_path: Some(script_path),
+                    pid: Some(pid),
+                    healthy,
+                    server_reachable: false,
+                    server_port,
+                    health_url,
+                    started_at: Some(started_at),
+                    usage_state: UsageState::Unknown,
+                    avg_tokens_per_second: None,
+                    avg_speculative_acceptance_rate: None,
+                    vram: VramStatus::default(),
+                }
+            }
             None => Status {
+                // `running` intentionally describes the configured main model;
+                // auxiliary membership is exposed by `running_profile_ids`.
                 running: false,
+                running_profile_ids,
                 current_profile_id: None,
                 alias: None,
                 current_profile_name: None,
@@ -257,8 +295,8 @@ impl AppState {
                 pid: None,
                 healthy: false,
                 server_reachable: false,
-                server_port: settings.server_port,
-                health_url: settings.health_url.clone(),
+                server_port,
+                health_url,
                 started_at: None,
                 usage_state: UsageState::Unknown,
                 avg_tokens_per_second: None,

@@ -38,8 +38,8 @@ pub fn notify(app: &AppHandle, state: &Arc<AppState>) {
 
 /// Quick health probe: returns true if the URL produced any HTTP response
 /// (even a 4xx/5xx), i.e. something is actually listening and answering.
-pub fn probe_reachable(url: &str) -> bool {
-    probe_health(url).reachable
+pub fn probe_reachable_with_key(url: &str, api_key: Option<&str>) -> bool {
+    probe_health_with_key(url, api_key).reachable
 }
 
 struct HealthProbe {
@@ -47,11 +47,11 @@ struct HealthProbe {
     healthy: bool,
 }
 
-fn probe_health(url: &str) -> HealthProbe {
+fn probe_health_with_key(url: &str, api_key: Option<&str>) -> HealthProbe {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(800))
         .build();
-    match agent.get(url).call() {
+    match with_optional_bearer(agent.get(url), api_key).call() {
         Ok(response) => HealthProbe {
             reachable: true,
             healthy: response.status() >= 200 && response.status() < 400,
@@ -72,7 +72,13 @@ fn probe_health(url: &str) -> HealthProbe {
 /// same profile under Llama Switcher so logs and lifecycle controls work.
 pub fn status_with_probe(app: &AppHandle, state: &Arc<AppState>) -> Status {
     let mut s = state.status();
-    let health = probe_health(&s.health_url);
+    let health_key = state
+        .running
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|rp| rp.api_key.clone());
+    let health = probe_health_with_key(&s.health_url, health_key.as_deref());
     s.server_reachable = health.reachable;
     if s.running {
         s.healthy = health.healthy;
@@ -153,7 +159,8 @@ pub fn wait_for_server_idle(state: &Arc<AppState>, timeout: Duration) -> bool {
         if !status.running {
             return true;
         }
-        if probe_health(&status.health_url).healthy
+        let key = usage_probe_api_key(state, &status);
+        if probe_health_with_key(&status.health_url, key.as_deref()).healthy
             && probe_usage_state(state, &status) == UsageState::Free
         {
             return true;
@@ -1245,10 +1252,13 @@ pub fn sweep_stale_servers(app: &AppHandle, state: &Arc<AppState>, status: &Stat
         .unwrap()
         .as_ref()
         .map(|running| running.pid);
-    let allowed = managed_root
+    let mut allowed = managed_root
         .or_else(|| status.server_reachable.then_some(status.pid).flatten())
         .map(process_tree::descendants)
         .unwrap_or_default();
+    for process in state.auxiliary_running.lock().unwrap().iter() {
+        allowed.extend(process_tree::descendants(process.pid));
+    }
     let count = process_tree::kill_all_by_image_except(&settings.server_process_names, &allowed);
     if count > 0 {
         let _ = app.emit(
@@ -1267,17 +1277,66 @@ pub fn sweep_stale_servers(app: &AppHandle, state: &Arc<AppState>, status: &Stat
 /// the stop timeout elapses. Public entry — serialized via `op_lock`.
 pub fn stop_server(app: &AppHandle, state: &Arc<AppState>) -> Result<Status, String> {
     let _op = state.op_lock.lock().unwrap();
-    stop_locked(app, state)
+    stop_locked(app, state, true)
+}
+
+/// Stop one managed profile without disturbing models on other ports.
+pub fn stop_profile(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    profile_id: &str,
+) -> Result<Status, String> {
+    let _op = state.op_lock.lock().unwrap();
+
+    let is_main = state
+        .running
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|process| process.profile.id == profile_id);
+    if is_main {
+        return stop_locked(app, state, false);
+    }
+
+    let process = {
+        let mut running = state.auxiliary_running.lock().unwrap();
+        let index = running
+            .iter()
+            .position(|process| process.profile.id == profile_id)
+            .ok_or_else(|| "That profile is not currently managed or running.".to_string())?;
+        running.remove(index)
+    };
+
+    let mut process = process;
+    logging::append_line(&process.log_path, "Stop requested for this profile.");
+    process_tree::kill_tree(process.pid);
+    let _ = process.child.wait();
+    notify(app, state);
+    Ok(state.status())
 }
 
 /// Stop implementation. Assumes the caller already holds `op_lock`.
-fn stop_locked(app: &AppHandle, state: &Arc<AppState>) -> Result<Status, String> {
+fn stop_locked(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    stop_auxiliaries: bool,
+) -> Result<Status, String> {
     let settings = state.settings_snapshot();
+    if stop_auxiliaries {
+        let auxiliaries = std::mem::take(&mut *state.auxiliary_running.lock().unwrap());
+        for mut process in auxiliaries {
+            logging::append_line(&process.log_path, "Stop requested.");
+            process_tree::kill_tree(process.pid);
+            let _ = process.child.wait();
+        }
+    }
     let mut rp = match state.running.lock().unwrap().take() {
         Some(rp) => rp,
         None => {
             stop_external_listener(app, &settings, "Stop requested")?;
-            enforce_single_server(app, &settings, "Stop");
+            if stop_auxiliaries {
+                enforce_single_server(app, &settings, "Stop");
+            }
             notify(app, state);
             *state.external_pid_checked.lock().unwrap() = None;
             *state.usage_probe_disabled.lock().unwrap() = false;
@@ -1328,7 +1387,11 @@ fn stop_locked(app: &AppHandle, state: &Arc<AppState>) -> Result<Status, String>
 
     // Final sweep: terminate any stray server processes (detached, orphaned, or
     // bound to a different port) so exactly zero servers remain after a stop.
-    let swept = enforce_single_server(app, &settings, "Stop");
+    let swept = if stop_auxiliaries {
+        enforce_single_server(app, &settings, "Stop")
+    } else {
+        0
+    };
     if swept > 0 {
         logging::append_line(
             &log_path,
@@ -1400,22 +1463,42 @@ pub fn activate_profile(
     )?;
     validate_gateway_backend_binding(&settings, &profile.script_path)?;
 
+    let profile_port = profile_server_port(&profile.script_path).unwrap_or(settings.server_port);
+    if settings.security_gateway_enabled && profile_port == settings.security_gateway_port {
+        return Err(format!(
+            "{} uses port {}, which is reserved by the security gateway. Choose a different model or gateway port.",
+            profile.alias, profile_port
+        ));
+    }
+
     // Serialize the entire start/switch so two activations cannot race and
     // leave two servers running. Held until the new server is launched.
     let _op = state.op_lock.lock().unwrap();
 
+    if profile_port != settings.server_port {
+        return activate_auxiliary_locked(app, state, &settings, profile, profile_port, api_key);
+    }
+
+    let has_main = state.running.lock().unwrap().is_some();
+    let auxiliary_count = state.auxiliary_running.lock().unwrap().len();
+    if !has_main && auxiliary_count >= settings.max_simultaneous_models {
+        return Err(format!(
+            "The simultaneous model limit ({}) has been reached. Stop a running model or raise it in Settings.",
+            settings.max_simultaneous_models
+        ));
+    }
+
     // Stop any currently running managed process (handles both switch & restart).
     if state.running.lock().unwrap().is_some() {
-        stop_locked(app, state)?;
+        stop_locked(app, state, false)?;
     }
 
     // Always take ownership of the configured server port. This covers servers
     // launched at Windows sign-in, from a terminal, or by another application.
     ensure_port_available(app, &settings)?;
 
-    // Guarantee no stray server (any port, including orphans) survives before
-    // we launch exactly one.
-    enforce_single_server(app, &settings, "Start / Switch");
+    // Preserve managed auxiliary models. Only the configured main port is
+    // replaced here; the watchdog still removes genuinely stale processes.
     *state.external_pid_checked.lock().unwrap() = None;
     *state.usage_probe_disabled.lock().unwrap() = false;
     // Reset the tokens/sec average so it re-accumulates for the new model.
@@ -1609,8 +1692,13 @@ fn spawn_health_poller(app: AppHandle, state: Arc<AppState>, profile_id: String,
                 }
             }
 
-            let healthy = agent
-                .get(&settings.health_url)
+            let api_key = state
+                .running
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|rp| rp.api_key.clone());
+            let healthy = with_optional_bearer(agent.get(&settings.health_url), api_key.as_deref())
                 .call()
                 .map(|r| r.status() >= 200 && r.status() < 400)
                 .unwrap_or(false);
@@ -1638,6 +1726,131 @@ fn spawn_health_poller(app: AppHandle, state: Arc<AppState>, profile_id: String,
             thread::sleep(Duration::from_secs(1));
         }
     });
+}
+
+fn activate_auxiliary_locked(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    settings: &Settings,
+    profile: Profile,
+    port: u16,
+    api_key: Option<String>,
+) -> Result<Status, String> {
+    let has_main = state.running.lock().unwrap().is_some();
+    {
+        let mut running = state.auxiliary_running.lock().unwrap();
+        if let Some(index) = running
+            .iter()
+            .position(|item| profile_server_port(&item.profile.script_path) == Some(port))
+        {
+            let mut old = running.remove(index);
+            process_tree::kill_tree(old.pid);
+            let _ = old.child.wait();
+        }
+        let total = running.len() + usize::from(has_main);
+        if total >= settings.max_simultaneous_models {
+            return Err(format!(
+                "The simultaneous model limit ({}) has been reached. Stop a running model or raise it in Settings.",
+                settings.max_simultaneous_models
+            ));
+        }
+    }
+    if !is_port_free(port) {
+        return Err(format!(
+            "Port {port} is already in use; two models cannot share one port."
+        ));
+    }
+
+    let log_path = logging::create_run_log(&state.logs_dir, &profile, None);
+    let child = spawn_script(&profile, &log_path, api_key.as_deref())?;
+    let pid = child.id();
+    let started_at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    logging::append_line(
+        &log_path,
+        &format!("Launched auxiliary shell PID {pid} on port {port}."),
+    );
+    state
+        .auxiliary_running
+        .lock()
+        .unwrap()
+        .push(RunningProcess {
+            profile: profile.clone(),
+            api_key: api_key.clone(),
+            pid,
+            child,
+            started_at,
+            log_path: log_path.clone(),
+            healthy: false,
+        });
+    notify(app, state);
+    spawn_auxiliary_health_poller(
+        app.clone(),
+        Arc::clone(state),
+        profile.id,
+        pid,
+        port,
+        api_key,
+    );
+    Ok(state.status())
+}
+
+fn spawn_auxiliary_health_poller(
+    app: AppHandle,
+    state: Arc<AppState>,
+    profile_id: String,
+    pid: u32,
+    port: u16,
+    api_key: Option<String>,
+) {
+    thread::spawn(move || {
+        let settings = state.settings_snapshot();
+        let deadline =
+            Instant::now() + Duration::from_secs(settings.health_check_timeout_seconds.max(1));
+        let url = format!("http://127.0.0.1:{port}/health");
+        loop {
+            if !state
+                .auxiliary_running
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.pid == pid && p.profile.id == profile_id)
+            {
+                return;
+            }
+            if probe_health_with_key(&url, api_key.as_deref()).healthy {
+                if let Some(process) = state
+                    .auxiliary_running
+                    .lock()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|p| p.pid == pid)
+                {
+                    process.healthy = true;
+                    logging::append_line(&process.log_path, "Health check: HEALTHY.");
+                }
+                notify(&app, &state);
+                return;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    });
+}
+
+/// Resolve a profile's explicit llama-server port. Profiles without a `--port`
+/// flag are treated as main-port profiles for backward compatibility.
+fn profile_server_port(script_path: &str) -> Option<u16> {
+    let text = std::fs::read_to_string(script_path).ok()?;
+    for line in text.lines() {
+        if let Some(value) = parse_flag_value(line, "--port") {
+            if let Ok(port) = value.parse::<u16>() {
+                return Some(port);
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1699,7 +1912,14 @@ fn wait_for_restart_ready(
 
         let listener_pid = pid_on_port(settings.server_port);
         let listener_replaced = restart_has_replacement_listener(old_listener_pid, listener_pid);
-        let health = listener_replaced.then(|| probe_health(&settings.health_url));
+        let key = state
+            .running
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|rp| rp.api_key.clone());
+        let health =
+            listener_replaced.then(|| probe_health_with_key(&settings.health_url, key.as_deref()));
         if health.as_ref().is_some_and(|probe| probe.healthy) {
             {
                 let mut running = state.running.lock().unwrap();

@@ -306,6 +306,20 @@ export function SettingsPage({
           <span className="hint">Updates the health URL port automatically.</span>
         </div>
         <div className="field">
+          <label>Maximum simultaneous models</label>
+          <input
+            type="number"
+            min={1}
+            max={16}
+            value={settings.maxSimultaneousModels}
+            onChange={(e) => update("maxSimultaneousModels", Math.min(16, Math.max(1, Number(e.target.value) || 1)))}
+          />
+          <span className="hint">
+            Each model must use a different port. The configured server port
+            above is always the main model and the only gateway backend.
+          </span>
+        </div>
+        <div className="field">
           <label>Health URL</label>
           <input
             type="text"
@@ -379,14 +393,14 @@ export function SettingsPage({
           />
           <span className="hint">
             Comma-separated. Every process with one of these image names is
-            killed before a new server launches, guaranteeing only one runs at a
-            time. Default: <span className="mono">llama-server.exe</span>. Change
+            monitored for stale processes. Managed models on distinct ports are
+            preserved up to the simultaneous-model limit. Default: <span className="mono">llama-server.exe</span>. Change
             this if your llama.cpp binary has a different name.
           </span>
         </div>
         <span className="hint">
-          Start / Switch always stops the current process on this port first,
-          including servers launched outside Llama Switcher.
+          Starting a profile replaces only the model using the same port. Port
+          1234 (or the configured main port) remains the gateway-facing model.
         </span>
       </div>
 
@@ -438,7 +452,7 @@ export function SettingsPage({
           <label>Gateway port</label>
           <input type="number" value={settings.securityGatewayPort}
             onChange={(e) => updateSecurity("securityGatewayPort", Number(e.target.value))} />
-          <span className="hint">Changing the gateway port or access mode requires restarting Llama Switcher.</span>
+          <span className="hint">This port is reserved for the gateway and cannot also host a model. Changing it or the access mode requires restarting Llama Switcher.</span>
         </div>
         <div className="field">
           <label>Access mode</label>

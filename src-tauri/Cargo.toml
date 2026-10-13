@@ -1,6 +1,6 @@
 [package]
 name = "llama-switcher"
-version = "0.1.1"
+version = "0.1.2"
 description = "Lightweight Windows tray app for switching llama.cpp server profiles."
 authors = ["Llama Switcher"]
 edition = "2021"

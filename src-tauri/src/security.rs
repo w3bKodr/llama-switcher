@@ -1,6 +1,5 @@
 //! Cloudflare-aware HTTP security gateway for llama-server.
 
-use crate::process_manager;
 use crate::settings::{NetworkAccessMode, Settings};
 use crate::state::AppState;
 use chrono::{DateTime, Duration, Utc};
@@ -247,12 +246,17 @@ fn handle(state: &Arc<AppState>, mut request: Request) {
     }
 
     if !is_public_path(path) {
+        // Copy the launch credential while holding `running`, then release the
+        // mutex before consulting settings or recording a failure. Keeping the
+        // running-process lock while resolving settings inverted the lock order
+        // used by status polling and could deadlock the entire app under
+        // simultaneous gateway traffic and widget/dashboard refreshes.
         let expected = state
             .running
             .lock()
             .unwrap()
             .as_ref()
-            .and_then(|rp| process_manager::resolve_api_key(state, Some(&rp.profile.script_path)))
+            .and_then(|rp| rp.api_key.clone())
             .or_else(|| settings.llama_server_api_key.clone());
         if let Some(key) = expected {
             if header(&request, "Authorization").as_deref() != Some(&format!("Bearer {key}")) {
