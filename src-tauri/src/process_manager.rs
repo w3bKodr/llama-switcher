@@ -524,7 +524,7 @@ fn fetch_metrics_body(state: &Arc<AppState>, url: &str, api_key: Option<&str>) -
             disable_usage_probe_after_auth_status(state, status);
             None
         }
-        Err(_) if api_key.is_some() => {
+        Err(error) if api_key.is_some() && !is_transient(&error) => {
             // Some llama.cpp forks close an unauthorized connection before
             // writing an HTTP status line. Treat that transport failure like
             // an auth rejection so status polling cannot flood server logs.
@@ -533,6 +533,28 @@ fn fetch_metrics_body(state: &Arc<AppState>, url: &str, api_key: Option<&str>) -
         }
         Err(_) => None,
     }
+}
+
+/// A slow or refused answer is not an auth rejection. Strata stalls telemetry
+/// while it tokenizes very long prompts, and the port is briefly closed while a
+/// script restarts its server; neither may disable probing for the whole run.
+fn is_transient(error: &ureq::Error) -> bool {
+    let ureq::Error::Transport(transport) = error else {
+        return false;
+    };
+    let mut source = std::error::Error::source(transport);
+    while let Some(error) = source {
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::ConnectionRefused
+            );
+        }
+        source = error.source();
+    }
+    false
 }
 
 fn disable_usage_probe_after_auth_status(state: &Arc<AppState>, status: u16) {
@@ -735,7 +757,7 @@ fn probe_slots_usage_state(state: &Arc<AppState>, status: &Status) -> Option<Usa
             *state.usage_probe_disabled.lock().unwrap() = true;
             return None;
         }
-        Err(_) if api_key.is_some() => {
+        Err(error) if api_key.is_some() && !is_transient(&error) => {
             *state.usage_probe_disabled.lock().unwrap() = true;
             return None;
         }
@@ -2198,6 +2220,41 @@ mod tests {
 
         let reconciled = reconcile_vram_processes(live, 24_576, &server_tree);
         assert_eq!(reconciled[0].pid, 56_116);
+    }
+
+    #[test]
+    fn slow_telemetry_is_transient_but_a_dropped_connection_is_not() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_millis(200))
+            .build();
+
+        // Accepts the request but never answers (a server busy tokenizing).
+        let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent_url = format!("http://{}/metrics", silent.local_addr().unwrap());
+        let hold = thread::spawn(move || {
+            let (mut stream, _) = silent.accept().unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf);
+            thread::sleep(Duration::from_millis(600));
+        });
+        let error = agent.get(&silent_url).call().unwrap_err();
+        assert!(is_transient(&error), "{error:?}");
+        hold.join().unwrap();
+
+        // Closes without a status line (a fork rejecting the key).
+        let closing = TcpListener::bind("127.0.0.1:0").unwrap();
+        let closing_url = format!("http://{}/metrics", closing.local_addr().unwrap());
+        let close = thread::spawn(move || {
+            let (mut stream, _) = closing.accept().unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf);
+        });
+        let error = agent.get(&closing_url).call().unwrap_err();
+        close.join().unwrap();
+        assert!(!is_transient(&error), "{error:?}");
     }
 
     #[test]
