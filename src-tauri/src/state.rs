@@ -89,6 +89,10 @@ pub struct TpsTracker {
     /// Log source: cumulative generation tokens and milliseconds parsed so far.
     pub log_gen_tokens: f64,
     pub log_gen_ms: f64,
+    /// Strata serves llama.cpp-named counters on /metrics/prometheus.
+    pub strata_prometheus: bool,
+    /// Metrics source: cumulative (drafts accepted, drafts offered).
+    pub metrics_spec: Option<(f64, f64)>,
 }
 
 #[derive(Default)]

@@ -243,16 +243,21 @@ fn probe_vram(server_pid: Option<u32>) -> VramStatus {
             }
         }
     }
-    processes = reconcile_vram_processes(processes, total_mib, server_pid);
+    // The tracked PID is usually the launch shell; the allocation belongs to a
+    // child (llama-server) or grandchild (e.g. Strata's python -> strata.exe).
+    let server_pids = server_pid
+        .map(process_tree::descendants)
+        .unwrap_or_default();
+    processes = reconcile_vram_processes(processes, total_mib, &server_pids);
     // Under Windows' WDDM driver mode, nvidia-smi often reports total VRAM but
     // omits every process. Windows' own GPU counters expose those allocations.
-    let mut windows_processes = probe_windows_vram_processes();
+    let mut windows_processes = probe_windows_vram_processes(&server_pids);
     if !windows_processes.is_empty() {
         // DWM mirrors application surfaces for desktop composition. Its
         // Dedicated Usage is already attributed to the owning applications,
         // so including it makes the process rows exceed physical VRAM usage.
         windows_processes.retain(|process| !process.name.eq_ignore_ascii_case("dwm"));
-        processes = reconcile_vram_processes(windows_processes, total_mib, server_pid);
+        processes = reconcile_vram_processes(windows_processes, total_mib, &server_pids);
         let process_used_mib = processes
             .iter()
             .map(|process| process.used_mib)
@@ -264,15 +269,15 @@ fn probe_vram(server_pid: Option<u32>) -> VramStatus {
             free_mib = total_mib - process_used_mib;
         }
     }
-    let model_mib = server_pid
-        .and_then(|pid| {
-            processes
-                .iter()
-                .find(|process| process.pid == pid)
-                .map(|process| process.used_mib)
-        })
-        // The tracked PID is usually the launch shell. Find its llama-server
-        // child by name when Windows attributes the allocation to that child.
+    let tree_mib = processes
+        .iter()
+        .filter(|process| server_pids.contains(&process.pid))
+        .map(|process| process.used_mib)
+        .sum::<u64>();
+    let model_mib = (tree_mib > 0)
+        .then_some(tree_mib)
+        // Fall back to a llama-server by name when the allocation is not
+        // attributed to the launched process tree.
         .or_else(|| {
             processes
                 .iter()
@@ -299,12 +304,12 @@ fn is_llama_server_process(name: &str) -> bool {
 fn reconcile_vram_processes(
     mut processes: Vec<VramProcess>,
     total_mib: u64,
-    server_pid: Option<u32>,
+    server_pids: &[u32],
 ) -> Vec<VramProcess> {
     processes.retain(|process| process.used_mib > 0 && process.used_mib <= total_mib);
     processes.sort_by(|a, b| {
-        let a_is_server = Some(a.pid) == server_pid || is_llama_server_process(&a.name);
-        let b_is_server = Some(b.pid) == server_pid || is_llama_server_process(&b.name);
+        let a_is_server = server_pids.contains(&a.pid) || is_llama_server_process(&a.name);
+        let b_is_server = server_pids.contains(&b.pid) || is_llama_server_process(&b.name);
         b_is_server
             .cmp(&a_is_server)
             .then_with(|| b.used_mib.cmp(&a.used_mib))
@@ -326,34 +331,60 @@ fn reconcile_vram_processes(
 struct VramProcessCache {
     sampled_at: Option<Instant>,
     processes: Vec<VramProcess>,
+    active_pids: Option<HashSet<u32>>,
     refreshing: bool,
 }
 
 /// Return the most recent Windows per-process VRAM sample immediately. A slow
 /// Get-Counter refresh runs in the background so it never stalls status, tray,
 /// or UI refresh calls.
-fn probe_windows_vram_processes() -> Vec<VramProcess> {
+fn probe_windows_vram_processes(server_pids: &[u32]) -> Vec<VramProcess> {
     static CACHE: OnceLock<Arc<Mutex<VramProcessCache>>> = OnceLock::new();
     let cache = Arc::clone(CACHE.get_or_init(|| Arc::new(Mutex::new(VramProcessCache::default()))));
     let mut cached = cache.lock().unwrap();
+    let current = filter_live_vram_processes(
+        cached.processes.clone(),
+        cached.active_pids.as_ref(),
+        server_pids,
+    );
     let fresh = cached
         .sampled_at
         .is_some_and(|sampled_at| sampled_at.elapsed() < Duration::from_secs(8));
     if fresh || cached.refreshing {
-        return cached.processes.clone();
+        return current;
     }
     cached.refreshing = true;
-    let current = cached.processes.clone();
     drop(cached);
 
     thread::spawn(move || {
         let processes = query_windows_vram_processes();
+        let active_pids = query_active_gpu_pids();
         let mut cached = cache.lock().unwrap();
         cached.processes = processes;
+        cached.active_pids = active_pids;
         cached.sampled_at = Some(Instant::now());
         cached.refreshing = false;
     });
     current
+}
+
+/// The Windows counter provider can retain a large allocation after its owner
+/// exits. If Windows later reuses that PID, Get-Process gives the stale
+/// allocation the new process's name (the observed 20 GB Firefox bug). NVIDIA
+/// pmon is a live list, so require displayed PIDs to be active there. The
+/// server's own process tree is exempt: pmon omits some CUDA engines (Strata's
+/// strata.exe) even while they hold most of the card.
+fn filter_live_vram_processes(
+    mut processes: Vec<VramProcess>,
+    active_pids: Option<&HashSet<u32>>,
+    server_pids: &[u32],
+) -> Vec<VramProcess> {
+    if let Some(active_pids) = active_pids {
+        processes.retain(|process| {
+            active_pids.contains(&process.pid) || server_pids.contains(&process.pid)
+        });
+    }
+    processes
 }
 
 fn query_windows_vram_processes() -> Vec<VramProcess> {
@@ -381,14 +412,6 @@ fn query_windows_vram_processes() -> Vec<VramProcess> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    // The Windows counter provider can retain a large allocation after its
-    // owner exits. If Windows later reuses that PID, Get-Process gives the
-    // stale allocation the new process's name (the observed 20 GB Firefox
-    // bug). NVIDIA pmon is a live list, so require every displayed PID to be
-    // active there instead of trusting the stale counter instance name.
-    if let Some(active_pids) = query_active_gpu_pids() {
-        processes.retain(|process| active_pids.contains(&process.pid));
-    }
     processes.sort_by(|a, b| b.used_mib.cmp(&a.used_mib));
     processes
 }
@@ -445,34 +468,42 @@ fn probe_metrics_tps(state: &Arc<AppState>, status: &Status) -> Option<f64> {
         return None;
     }
     let api_key = usage_probe_api_key(state, status);
-    let url = format!(
-        "{}/metrics",
-        server_origin(&status.health_url, status.server_port)
-    );
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_millis(800))
-        .build();
-    let response = match with_optional_bearer(agent.get(&url), api_key.as_deref()).call() {
-        Ok(response) => response,
-        Err(ureq::Error::Status(status @ (401 | 403), _)) => {
-            disable_usage_probe_after_auth_status(state, status);
-            return None;
+    let origin = server_origin(&status.health_url, status.server_port);
+    let use_strata_path = state.tps.lock().unwrap().strata_prometheus;
+    let mut body = fetch_metrics_body(
+        state,
+        &format!(
+            "{}{}",
+            origin,
+            if use_strata_path { "/metrics/prometheus" } else { "/metrics" }
+        ),
+        api_key.as_deref(),
+    )?;
+    // Strata answers plain /metrics with its JSON monitor payload and serves
+    // the llama.cpp-named counters on /metrics/prometheus instead. llama.cpp
+    // always returns Prometheus text, so it never takes this branch.
+    if !use_strata_path && body.trim_start().starts_with('{') {
+        body = fetch_metrics_body(
+            state,
+            &format!("{}/metrics/prometheus", origin),
+            api_key.as_deref(),
+        )?;
+        if parse_prometheus_metric(&body, "llamacpp:tokens_predicted_total").is_some() {
+            state.tps.lock().unwrap().strata_prometheus = true;
         }
-        Err(_) if api_key.is_some() => {
-            // Some llama.cpp forks close an unauthorized connection before
-            // writing an HTTP status line. Treat that transport failure like
-            // an auth rejection so status polling cannot flood server logs.
-            *state.usage_probe_disabled.lock().unwrap() = true;
-            return None;
-        }
-        Err(_) => return None,
-    };
-    let body = response.into_string().ok()?;
+    }
 
+    let mut t = state.tps.lock().unwrap();
+    // Strata's draft counters; llama.cpp reports acceptance in its log instead.
+    if let (Some(accepted), Some(offered)) = (
+        parse_prometheus_metric(&body, "strata:drafts_accepted_total"),
+        parse_prometheus_metric(&body, "strata:drafts_offered_total"),
+    ) {
+        t.metrics_spec = Some((accepted, offered));
+    }
     let tokens = parse_prometheus_metric(&body, "llamacpp:tokens_predicted_total")?;
     let seconds = parse_prometheus_metric(&body, "llamacpp:tokens_predicted_seconds_total")?;
 
-    let mut t = state.tps.lock().unwrap();
     let (base_tokens, base_seconds) = *t.metrics_baseline.get_or_insert((tokens, seconds));
     let d_tokens = tokens - base_tokens;
     let d_seconds = seconds - base_seconds;
@@ -480,6 +511,27 @@ fn probe_metrics_tps(state: &Arc<AppState>, status: &Status) -> Option<f64> {
         Some(d_tokens / d_seconds)
     } else {
         None
+    }
+}
+
+fn fetch_metrics_body(state: &Arc<AppState>, url: &str, api_key: Option<&str>) -> Option<String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_millis(800))
+        .build();
+    match with_optional_bearer(agent.get(url), api_key).call() {
+        Ok(response) => response.into_string().ok(),
+        Err(ureq::Error::Status(status @ (401 | 403), _)) => {
+            disable_usage_probe_after_auth_status(state, status);
+            None
+        }
+        Err(_) if api_key.is_some() => {
+            // Some llama.cpp forks close an unauthorized connection before
+            // writing an HTTP status line. Treat that transport failure like
+            // an auth rejection so status polling cannot flood server logs.
+            *state.usage_probe_disabled.lock().unwrap() = true;
+            None
+        }
+        Err(_) => None,
     }
 }
 
@@ -587,7 +639,14 @@ fn probe_avg_speculative_acceptance(state: &Arc<AppState>, status: &Status) -> O
     }
     tracker.log_offset += consumed as u64;
 
-    weighted_spec_acceptance(tracker.accepted_tokens, tracker.generated_tokens)
+    let from_log = weighted_spec_acceptance(tracker.accepted_tokens, tracker.generated_tokens);
+    drop(tracker);
+    from_log.or_else(|| {
+        // Servers without llama.cpp acceptance lines (Strata) report
+        // cumulative draft counters through the metrics probe instead.
+        let (accepted, offered) = state.tps.lock().unwrap().metrics_spec?;
+        (offered > 0.0).then(|| accepted / offered)
+    })
 }
 
 fn parse_draft_acceptance_line(line: &str) -> Option<(u64, u64)> {
@@ -2094,7 +2153,7 @@ mod tests {
             vram_process(12_832, "explorer", 80),
         ];
 
-        let reconciled = reconcile_vram_processes(processes, 24_576, Some(11_736));
+        let reconciled = reconcile_vram_processes(processes, 24_576, &[11_736]);
 
         assert!(reconciled
             .iter()
@@ -2117,8 +2176,49 @@ mod tests {
             vram_process(202, "renderer", 10_000),
         ];
 
-        let reconciled = reconcile_vram_processes(processes, 24_576, Some(101));
+        let reconciled = reconcile_vram_processes(processes, 24_576, &[101]);
         assert_eq!(reconciled.len(), 2);
+    }
+
+    #[test]
+    fn keeps_server_tree_allocations_missing_from_nvidia_pmon() {
+        // Strata: cmd 64380 -> python 25884 -> strata.exe 56116. pmon omits
+        // strata.exe, and a stale counter for dead PID 2188 must still be dropped.
+        let processes = vec![
+            vram_process(56_116, "strata", 21_398),
+            vram_process(2_188, "firefox", 6_972),
+            vram_process(15_368, "explorer", 300),
+        ];
+        let active: HashSet<u32> = [15_368].into_iter().collect();
+        let server_tree = [64_380, 25_884, 56_116];
+
+        let live = filter_live_vram_processes(processes, Some(&active), &server_tree);
+        let names: Vec<_> = live.iter().map(|process| process.name.as_str()).collect();
+        assert_eq!(names, ["strata", "explorer"]);
+
+        let reconciled = reconcile_vram_processes(live, 24_576, &server_tree);
+        assert_eq!(reconciled[0].pid, 56_116);
+    }
+
+    #[test]
+    fn parses_strata_prometheus_counters() {
+        // Real sample captured from Strata's `/metrics/prometheus`.
+        let body = "llamacpp:tokens_predicted_total 9379\n\
+                    llamacpp:tokens_predicted_seconds_total 97.29420000000002\n\
+                    strata:drafts_offered_total 7874\n\
+                    strata:drafts_accepted_total 5759\n";
+        assert_eq!(
+            parse_prometheus_metric(body, "llamacpp:tokens_predicted_total"),
+            Some(9_379.0)
+        );
+        assert_eq!(
+            parse_prometheus_metric(body, "strata:drafts_accepted_total"),
+            Some(5_759.0)
+        );
+        assert_eq!(
+            parse_prometheus_metric(body, "strata:drafts_offered_total"),
+            Some(7_874.0)
+        );
     }
 
     #[test]
